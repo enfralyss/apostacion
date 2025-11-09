@@ -1,0 +1,26 @@
+# Dependencias Mínimas para Fase 1
+# Instala solo lo esencial para que el bot funcione
+
+# Core ML
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+xgboost>=1.7.0
+
+# Utilities
+pyyaml>=6.0.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+
+# Database
+sqlalchemy>=2.0.0
+
+# Basic web
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Scheduling
+APScheduler>=3.10.0
+
+# Testing
+pytest>=7.4.0

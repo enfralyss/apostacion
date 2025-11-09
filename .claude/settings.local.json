@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python daily_bot.py:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
