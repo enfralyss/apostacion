@@ -228,7 +228,7 @@ class BettingModel:
 
 
 def train_all_models():
-    """Entrena modelos para soccer y NBA"""
+    """Entrena modelos sólo para deportes habilitados en config (actual: soccer)."""
     from src.utils.data_generator import generate_training_data
     from src.utils.database import BettingDatabase
     import json
@@ -308,50 +308,12 @@ def train_all_models():
     except Exception as e:
         logger.error(f"Error saving soccer model metrics to DB: {e}")
 
-    # NBA Model
+    # Summary (solo soccer)
     logger.info("\n" + "=" * 50)
-    logger.info("TRAINING NBA MODEL")
-    logger.info("=" * 50)
-
-    real_nba_csv = "data/training_real_nba.csv"
-    if os.path.exists(real_nba_csv):
-        try:
-            nba_data = pd.read_csv(real_nba_csv)
-            logger.info(f"Loaded real NBA dataset: {len(nba_data)} rows")
-        except Exception as e:
-            logger.warning(f"No se pudo cargar dataset real de NBA, usando sintético. Error: {e}")
-            nba_data = generate_training_data("nba", num_matches=2000)
-    else:
-        nba_data = generate_training_data("nba", num_matches=2000)
-    nba_model = BettingModel(sport="nba", model_type="xgboost")
-    nba_metrics = nba_model.train(nba_data, validation_split=0.2)
-    nba_model.save("models/nba_model.pkl")
-    nba_csv = nba_data.to_csv(index=False).encode('utf-8')
-    nba_hash = hashlib.md5(nba_csv).hexdigest()
-    nba_rows, nba_cols = nba_data.shape
-    with open("models/nba_model_metrics.json", 'w') as f:
-        json.dump({**nba_metrics, 'dataset_hash': nba_hash, 'dataset_rows': nba_rows, 'dataset_cols': nba_cols}, f, indent=2)
-    try:
-        cursor.execute("""
-            INSERT INTO model_registry (sport, model_type, test_accuracy, train_accuracy, cv_mean, cv_std, log_loss, auc_ovr, dataset_hash, dataset_rows, dataset_cols)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            'nba', 'xgboost', nba_metrics['test_accuracy'], nba_metrics['train_accuracy'],
-            nba_metrics['cv_accuracy_mean'], nba_metrics['cv_accuracy_std'], nba_metrics['log_loss'],
-            nba_metrics.get('auc_ovr'), nba_hash, nba_rows, nba_cols
-        ))
-        db.conn.commit()
-    except Exception as e:
-        logger.error(f"Error saving NBA model metrics to DB: {e}")
-    finally:
-        db.close()
-
-    # Summary
-    logger.info("\n" + "=" * 50)
-    logger.info("TRAINING SUMMARY")
+    logger.info("TRAINING SUMMARY (SOCCER ONLY)")
     logger.info("=" * 50)
     logger.info(f"Soccer Model - Test Accuracy: {soccer_metrics['test_accuracy']:.4f}")
-    logger.info(f"NBA Model - Test Accuracy: {nba_metrics['test_accuracy']:.4f}")
+    db.close()
 
 
 if __name__ == "__main__":

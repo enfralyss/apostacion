@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from src.scrapers.api_odds_fetcher import OddsAPIFetcher
 from src.utils.database import BettingDatabase
 from src.utils.notifications import TelegramNotifier
+from src.utils.clv_tracker import CLVTracker
 from src.models.predictor import MatchPredictor
 from src.betting.pick_selector import PickSelector
 from src.betting.parlay_builder import ParlayBuilder
@@ -29,6 +30,7 @@ class BettingScheduler:
         self.odds_fetcher = OddsAPIFetcher()
         self.notifier = TelegramNotifier()
         self.scheduler = BlockingScheduler()
+        self.clv = CLVTracker()
         
         logger.info("🤖 Betting Scheduler initialized")
 
@@ -38,7 +40,7 @@ class BettingScheduler:
             logger.info("📊 [CRON] Starting odds capture...")
             
             # Fetch odds from API
-            matches = self.odds_fetcher.get_available_matches("all")
+            matches = self.odds_fetcher.get_available_matches("soccer")
             
             if not matches:
                 logger.warning("No matches available from API")
@@ -86,7 +88,7 @@ class BettingScheduler:
             logger.info("🏆 [CRON] Starting results update...")
             
             # Fetch scores from API
-            scores = self.odds_fetcher.fetch_scores("all")
+            scores = self.odds_fetcher.fetch_scores("soccer")
             
             if not scores:
                 logger.info("No new scores available")
@@ -113,6 +115,39 @@ class BettingScheduler:
         except Exception as e:
             logger.error(f"Error in results update job: {e}")
             self.notifier.send_message(f"❌ Error actualizando resultados: {e}")
+
+    def job_update_closing_odds(self):
+        """CRON 2b: Actualiza closing odds para apuestas pendientes y calcula CLV por bet."""
+        try:
+            logger.info("⏱️ [CRON] Updating closing odds for pending bets...")
+            pending = self.db.get_pending_bets()
+            if not pending:
+                logger.info("No pending bets to update closing odds")
+                return
+            updated = 0
+            for bet in pending:
+                bet_id = bet['id']
+                picks = self.db.get_picks_for_bet(bet_id)
+                if not picks:
+                    continue
+                # Calcular closing odds del parlay multiplicando últimas odds de cada pick
+                closing_total_odds = 1.0
+                for p in picks:
+                    latest = self.db.get_latest_odds_for_match(p['match_id'], p['prediction'])
+                    # Si no hay latest, usar canonical como fallback
+                    if latest is None:
+                        latest = p.get('odds')
+                    if latest and latest > 0:
+                        closing_total_odds *= latest
+                if closing_total_odds <= 1.0:
+                    continue
+                # Guardar closing y CLV% a nivel bet
+                if self.db.update_bet_closing_odds(bet_id, closing_total_odds):
+                    updated += 1
+            if updated:
+                self.notifier.send_message(f"📈 Closing odds actualizadas para {updated} apuestas (CLV recalculado)")
+        except Exception as e:
+            logger.error(f"Error updating closing odds: {e}")
 
     def job_rebuild_dataset(self):
         """CRON 3: Rebuild training dataset y re-entrena modelo"""
@@ -214,8 +249,22 @@ class BettingScheduler:
             message += f"🔗 [Apostar en TriunfoBet](https://triunfobet.com)\n"
             message += f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             
-            # Enviar notificación
-            self.notifier.send_message(message)
+            # CLV stats para enriquecer notificación
+            try:
+                clv_stats = self.clv.get_clv_stats(days=30)
+            except Exception:
+                clv_stats = None
+
+            # Enviar notificación con CLV
+            try:
+                # Reusar método rico si disponible
+                self.notifier.send_daily_picks(picks, {
+                    'picks': picks,
+                    'total_odds': bet['total_odds'],
+                    'combined_probability': bet.get('combined_probability', 0.0)
+                }, bet['stake'], bet['bankroll_before'], clv_stats=clv_stats)
+            except Exception:
+                self.notifier.send_message(message)
             logger.info(f"✅ Picks notification sent: {len(picks)} picks")
             
         except Exception as e:
@@ -244,6 +293,16 @@ class BettingScheduler:
             replace_existing=True
         )
         logger.info("✅ Scheduled: Update results every 6 hours")
+
+        # CRON 2b: Actualizar closing odds - Cada 30 minutos
+        self.scheduler.add_job(
+            self.job_update_closing_odds,
+            CronTrigger(minute='*/30'),
+            id='update_closing_odds',
+            name='Update Closing Odds Every 30m',
+            replace_existing=True
+        )
+        logger.info("✅ Scheduled: Update closing odds every 30 minutes")
         
         # CRON 3: Rebuild dataset + re-entrenar - Domingos a las 3 AM
         self.scheduler.add_job(
@@ -265,7 +324,7 @@ class BettingScheduler:
         )
         logger.info("✅ Scheduled: Generate picks daily at 08:00")
         
-        # Ejecutar capture odds inmediatamente al inicio (opcional)
+    # Ejecutar capture odds inmediatamente al inicio (opcional)
         logger.info("🚀 Running initial odds capture...")
         self.job_capture_odds()
         

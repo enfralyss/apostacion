@@ -7,6 +7,7 @@ from src.backtesting.backtest_engine import BacktestEngine
 from src.backtesting.historical_data import HistoricalDataCollector
 from src.models.predictor import MatchPredictor
 from src.utils.data_generator import generate_training_data
+from src.utils.clv_tracker import CLVTracker
 
 st.set_page_config(page_title="TriunfoBet ML Bot", layout="wide")
 st.title("TriunfoBet ML Bot - Panel")
@@ -15,9 +16,9 @@ st.title("TriunfoBet ML Bot - Panel")
 db = BettingDatabase()
 
 # Secciones con tabs para organización
-tab_dashboard, tab_picks, tab_backtest, tab_realdata, tab_modelos, tab_hist = st.tabs([
-    "Dashboard", "Picks de hoy", "Backtesting", "Datos Reales", "Modelos", "Histórico"
-])
+tab_dashboard, tab_picks, tab_backtest, tab_realdata, tab_modelos, tab_hist, tab_clv = st.tabs([
+    "Dashboard", "Picks de hoy", "Backtesting", "Datos Reales", "Modelos", "Histórico", "CLV"
+ ])
 
 with tab_dashboard:
     metrics = db.calculate_performance_metrics()
@@ -58,6 +59,44 @@ with tab_picks:
             for pick in picks:
                 st.write(f"- {pick['league']}: {pick['home_team']} vs {pick['away_team']} | {pick['prediction']} | Odds: {pick['odds']} | Prob: {pick['predicted_probability']*100:.1f}% | Edge: {pick['edge']*100:.1f}%")
             st.markdown("---")
+
+        st.markdown("### 📝 Registrar colocación real (Placement Validation)")
+        with st.form("placement_form"):
+            bet_to_update = st.selectbox(
+                "Selecciona apuesta pendiente", 
+                [b['id'] for b in recent_bets if b['status'] == 'pending'],
+                help="Sólo apuestas pendientes admiten actualización de odds colocadas"
+            )
+            placed_odds = st.number_input("Odds reales obtenidas", min_value=1.01, step=0.01)
+            combined_prob_manual = st.number_input("Probabilidad combinada (si deseas sobreescribir)", min_value=0.0, max_value=1.0, value=0.0, help="Déjalo en 0 para usar la del parlay original")
+            submit_place = st.form_submit_button("Actualizar colocación")
+            if submit_place and bet_to_update:
+                # Recuperar probabilidad original si no se especifica
+                if combined_prob_manual == 0.0:
+                    try:
+                        # estimar desde picks
+                        picks_parlay = db.get_bet_picks(bet_to_update)
+                        combined_prob = 1.0
+                        for p in picks_parlay:
+                            combined_prob *= p.get('predicted_probability', 0)
+                    except Exception:
+                        combined_prob = None
+                else:
+                    combined_prob = combined_prob_manual
+                update_info = db.update_bet_placement(bet_to_update, placed_odds, combined_probability=combined_prob)
+                if update_info:
+                    st.success(f"Placement registrado. Stake ajustado: {update_info['adjusted_stake']:.2f}. Edge nuevo: {update_info['edge_at_placement']*100:.2f}%")
+                    st.json(update_info)
+                    # Notificar por Telegram si está configurado
+                    try:
+                        from src.utils.notifications import TelegramNotifier
+                        notifier = TelegramNotifier()
+                        if notifier.enabled:
+                            notifier.send_placement_update(update_info)
+                    except Exception:
+                        pass
+                else:
+                    st.error("No se pudo actualizar la colocación")
     else:
         st.info("No hay picks recientes.")
 
@@ -276,5 +315,75 @@ with tab_hist:
         st.dataframe(pd.DataFrame(bets))
     else:
         st.info("Sin apuestas registradas.")
+
+with tab_clv:
+    st.subheader("📊 CLV Analytics - Closing Line Value")
+    st.markdown("""
+    **CLV (Closing Line Value)** es el mejor indicador de si eres un apostador rentable a largo plazo.
+    
+    - **CLV > 3%**: Eres un sharp bettor, rentable a largo plazo
+    - **CLV > 0%**: Estás batiendo al mercado
+    - **CLV < 0%**: El mercado tiene mejores odds que tú al cierre
+    """)
+    
+    clv_tracker = CLVTracker()
+    
+    # Período de análisis
+    days = st.selectbox("Período de análisis", [7, 30, 90], index=1)
+    
+    # Stats principales
+    stats = clv_tracker.get_clv_stats(days=days)
+    analysis = clv_tracker.analyze_clv_performance()
+    
+    st.markdown(f"### {analysis['rating']}")
+    st.info(analysis['interpretation'])
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("CLV Promedio", f"{stats['avg_clv_percentage']:.2f}%", 
+                delta=f"{stats['avg_clv_percentage']:.2f}%")
+    col2.metric("Total Apuestas", stats['total_bets'])
+    col3.metric("CLV Positivos", f"{stats['positive_clv_rate']:.1f}%")
+    col4.metric("Mejor CLV", f"{stats['max_clv_percentage']:.2f}%")
+    
+    # Historial CLV
+    st.markdown("### 📈 Historial CLV")
+    history = clv_tracker.get_clv_history(limit=50)
+    
+    if history:
+        df_clv = pd.DataFrame(history)
+        df_clv['created_at'] = pd.to_datetime(df_clv['created_at'])
+        
+        # Gráfico de CLV temporal
+        st.line_chart(df_clv.set_index('created_at')['clv_percentage'])
+        
+        # Tabla detallada
+        st.dataframe(df_clv[[
+            'match_id', 'sport', 'opening_odds', 'bet_odds', 'closing_odds', 
+            'clv_percentage', 'created_at'
+        ]].style.background_gradient(subset=['clv_percentage'], cmap='RdYlGn'))
+    else:
+        st.info("No hay datos de CLV disponibles. Comienza a registrar apuestas con odds de apertura y cierre.")
+    
+    # Instrucciones
+    with st.expander("ℹ️ ¿Cómo usar CLV Analytics?"):
+        st.markdown("""
+        **1. Registra odds de apertura**: Cuando detectes un partido, guarda las primeras odds
+        
+        **2. Registra tus apuestas**: Guarda las odds exactas a las que apostaste
+        
+        **3. Actualiza odds de cierre**: Justo antes del inicio del partido, registra las últimas odds
+        
+        **4. Analiza tu CLV**: El sistema calcula automáticamente si batiste al mercado
+        
+        **Ejemplo**:
+        - Odds de apertura: 2.00
+        - Apostaste a: 2.10
+        - Odds de cierre: 1.95
+        - **CLV = (1.95 / 2.10) - 1 = -7.14%** ❌ (negativo)
+        
+        **Objetivo**: CLV promedio > 3% en 100+ apuestas = sharp bettor
+        """)
+    
+    clv_tracker.close()
 
 st.markdown("---\n_Desarrollado como MVP rápido con Streamlit_")

@@ -16,26 +16,48 @@ except Exception:
 
 load_dotenv()
 
+# Importar el gestor de API keys
+try:
+    from src.utils.api_key_manager import APIKeyManager
+except ImportError:
+    from utils.api_key_manager import APIKeyManager
+
 
 class OddsAPIFetcher:
     """
     Fetcher de odds usando The Odds API
     https://the-odds-api.com/
 
-    Plan gratuito: 500 requests/mes
+    Soporta pool de múltiples API keys con rotación automática
+    - Plan gratuito: 500 requests/mes por key
+    - Con 3 keys: 1500 requests/mes total
     """
 
     def __init__(self, api_key: str = None):
         """
         Args:
-            api_key: API key de The Odds API (obtener en https://the-odds-api.com/)
+            api_key: API key única (legacy) o None para usar pool de keys
         """
-        self.api_key = api_key or os.getenv('ODDS_API_KEY')
         self.base_url = "https://api.the-odds-api.com/v4"
 
+        # Si se provee una key específica, usarla (legacy mode)
+        if api_key:
+            self.api_key = api_key
+            self.key_manager = None
+            logger.info("Using single API key (legacy mode)")
+        else:
+            # Usar pool de keys con rotación
+            self.key_manager = APIKeyManager("ODDS_API_KEYS")
+            self.api_key = self.key_manager.get_current_key()
+
+            if not self.api_key:
+                # Fallback a variable antigua
+                self.api_key = os.getenv('ODDS_API_KEY')
+                logger.warning("No ODDS_API_KEYS pool found, using single ODDS_API_KEY")
+
         if not self.api_key:
-            logger.warning("No ODDS_API_KEY found. Get one free at https://the-odds-api.com/")
-            logger.warning("500 requests/month free tier available")
+            logger.warning("No API key found. Get free keys at https://the-odds-api.com/")
+            logger.warning("Add to .env as: ODDS_API_KEYS=key1,key2,key3")
 
     def get_available_matches(self, sport: str = "all") -> List[Dict]:
         """
@@ -101,6 +123,9 @@ class OddsAPIFetcher:
             }
 
             response = requests.get(url, params=params, timeout=10)
+
+            # Actualizar contador de uso de keys
+            self._update_key_usage_from_response(response)
 
             if response.status_code == 200:
                 data = response.json()
@@ -194,8 +219,18 @@ class OddsAPIFetcher:
             logger.debug(f"Error parsing event: {e}")
             return None
 
+    def _update_key_usage_from_response(self, response: requests.Response):
+        """Actualiza el contador de requests del key manager basándose en la respuesta"""
+        if self.key_manager:
+            try:
+                remaining_str = response.headers.get('x-requests-remaining', '0')
+                remaining = int(remaining_str) if remaining_str.isdigit() else 0
+                self.key_manager.update_usage(remaining)
+            except Exception as e:
+                logger.debug(f"Could not update key usage: {e}")
+
     def check_api_status(self) -> Dict:
-        """Verifica el estado de la API y requests restantes"""
+        """Verifica el estado de la API y requests restantes (soporta pool)"""
 
         if not self.api_key:
             return {'status': 'error', 'message': 'No API key'}
@@ -211,12 +246,22 @@ class OddsAPIFetcher:
             remaining = response.headers.get('x-requests-remaining', 'unknown')
             used = response.headers.get('x-requests-used', 'unknown')
 
-            return {
+            # Actualizar key manager si está activo
+            self._update_key_usage_from_response(response)
+
+            status_info = {
                 'status': 'ok' if response.status_code == 200 else 'error',
                 'requests_remaining': remaining,
                 'requests_used': used,
                 'status_code': response.status_code
             }
+
+            # Si hay pool, agregar status del pool
+            if self.key_manager:
+                pool_status = self.key_manager.get_pool_status()
+                status_info['pool'] = pool_status
+
+            return status_info
 
         except Exception as e:
             return {'status': 'error', 'message': str(e)}
@@ -284,6 +329,9 @@ class OddsAPIFetcher:
             }
 
             response = requests.get(url, params=params, timeout=10)
+
+            # Actualizar contador de uso de keys
+            self._update_key_usage_from_response(response)
 
             if response.status_code == 200:
                 data = response.json()

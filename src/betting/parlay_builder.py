@@ -2,7 +2,7 @@
 Parlay Builder - Construye apuestas combinadas optimizadas
 """
 
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from itertools import combinations
 from loguru import logger
 import yaml
@@ -32,6 +32,37 @@ class ParlayBuilder:
             total_odds *= pick['odds']
         return total_odds
 
+    @staticmethod
+    def decimal_to_american(odds: float) -> str:
+        if odds >= 2:
+            return f"+{int(round((odds - 1) * 100))}"
+        else:
+            return f"-{int(round(100 / (odds - 1)))}"
+
+    @staticmethod
+    def expected_value(prob: float, odds: float, stake: float) -> float:
+        return stake * (prob * (odds - 1) - (1 - prob))
+
+    def correlation_factor(self, picks: List[Dict]) -> float:
+        """Ajuste simple por correlación: si varias picks comparten liga o equipo.
+        Penaliza exceso de correlación para no sobreestimar probabilidad combinada.
+        Método heurístico MVP.
+        """
+        if not picks:
+            return 1.0
+        leagues = {}
+        teams = {}
+        for p in picks:
+            leagues[p['league']] = leagues.get(p['league'], 0) + 1
+            teams[p['home_team']] = teams.get(p['home_team'], 0) + 1
+            teams[p['away_team']] = teams.get(p['away_team'], 0) + 1
+        # Penalizaciones acumulativas
+        penalty = 0.0
+        penalty += sum((cnt - 1) * 0.02 for cnt in leagues.values() if cnt > 1)
+        penalty += sum((cnt - 1) * 0.015 for cnt in teams.values() if cnt > 1)
+        penalty = min(penalty, 0.15)  # Cap máximo 15%
+        return max(0.85, 1.0 - penalty)
+
     def calculate_parlay_probability(self, picks: List[Dict]) -> float:
         """
         Calcula la probabilidad combinada de que gane el parlay
@@ -46,7 +77,10 @@ class ParlayBuilder:
         combined_prob = 1.0
         for pick in picks:
             combined_prob *= pick['predicted_probability']
-        return combined_prob
+        # Ajustar por correlación
+        corr = self.correlation_factor(picks)
+        combined_prob_adj = combined_prob * corr
+        return combined_prob_adj
 
     def calculate_parlay_edge(self, picks: List[Dict]) -> float:
         """
@@ -77,10 +111,8 @@ class ParlayBuilder:
         """
         parlay_prob = self.calculate_parlay_probability(picks)
         parlay_odds = self.calculate_parlay_odds(picks)
-
         win_amount = stake * (parlay_odds - 1)
         loss_amount = stake
-
         ev = (parlay_prob * win_amount) - ((1 - parlay_prob) * loss_amount)
         return ev
 
@@ -163,6 +195,7 @@ class ParlayBuilder:
                 parlay_prob = self.calculate_parlay_probability(combo_list)
                 parlay_edge = self.calculate_parlay_edge(combo_list)
                 parlay_ev = self.calculate_parlay_expected_value(combo_list, 100)
+                corr_factor = self.correlation_factor(combo_list)
 
                 # Score: combinación de edge y EV
                 # Priorizamos edge pero también consideramos EV
@@ -175,6 +208,7 @@ class ParlayBuilder:
                         'num_picks': len(combo_list),
                         'total_odds': parlay_odds,
                         'combined_probability': parlay_prob,
+                        'correlation_factor': corr_factor,
                         'edge': parlay_edge,
                         'edge_percentage': parlay_edge * 100,
                         'expected_value': parlay_ev,
@@ -261,10 +295,12 @@ class ParlayBuilder:
             print()
 
         print(f"{'─'*80}")
-        print(f"💰 Total Odds: {parlay['total_odds']:.2f}x")
+        american_total = self.decimal_to_american(parlay['total_odds'])
+        print(f"💰 Total Odds: {parlay['total_odds']:.2f}x ({american_total})")
         print(f"🎲 Combined Probability: {parlay['combined_probability']:.1%}")
+        print(f"🔗 Correlation Factor: {parlay.get('correlation_factor',1.0):.3f}")
         print(f"📈 Parlay Edge: {parlay['edge_percentage']:.2f}%")
-        print(f"💵 Expected Value: ${parlay['expected_value']:.2f} per $100")
+        print(f"💵 Expected Value: ${parlay['expected_value']:.2f} per $100 (post-correlation)")
         print(f"\n💸 RECOMMENDED STAKE: ${stake:.2f} ({stake/bankroll*100:.1f}% of bankroll)")
         print(f"🏆 Potential Return: ${potential_return:.2f}")
         print(f"💎 Potential Profit: ${profit:.2f}")
@@ -272,33 +308,42 @@ class ParlayBuilder:
 
 
 if __name__ == "__main__":
-    # Test del builder
-    from src.scrapers.triunfobet_scraper import TriunfoBetScraper
+    # Test simple sin scraper externo
     from src.models.predictor import MatchPredictor
     from src.betting.pick_selector import PickSelector
     import os
 
-    print("=== Testing Parlay Builder ===\n")
+    print("=== Testing Parlay Builder (Simplified) ===\n")
 
-    # Entrenar modelos si no existen
     if not os.path.exists("models/soccer_model.pkl"):
         print("Training models first...")
         from src.models.train_model import train_all_models
         train_all_models()
 
-    # Pipeline completo
-    scraper = TriunfoBetScraper(use_mock=True)
+    # Mock de partidos mínimos
+    matches = [
+        {
+            'match_id': 'TEST1', 'sport': 'soccer', 'league': 'La Liga',
+            'home_team': 'Equipo A', 'away_team': 'Equipo B', 'match_date': '2025-11-10',
+            'odds': {'home_win': 2.05, 'away_win': 3.50, 'draw': 3.10}
+        },
+        {
+            'match_id': 'TEST2', 'sport': 'soccer', 'league': 'Serie A',
+            'home_team': 'Equipo C', 'away_team': 'Equipo D', 'match_date': '2025-11-10',
+            'odds': {'home_win': 1.90, 'away_win': 4.00, 'draw': 3.40}
+        },
+        {
+            'match_id': 'TEST3', 'sport': 'soccer', 'league': 'La Liga',
+            'home_team': 'Equipo E', 'away_team': 'Equipo F', 'match_date': '2025-11-10',
+            'odds': {'home_win': 2.20, 'away_win': 3.00, 'draw': 3.25}
+        }
+    ]
+
     predictor = MatchPredictor()
+    predictions = predictor.predict_multiple_matches(matches)
     selector = PickSelector()
+    picks = selector.select_picks(predictions)
     builder = ParlayBuilder()
 
-    # Obtener partidos, predecir, seleccionar picks
-    matches = scraper.get_available_matches("all")
-    predictions = predictor.predict_multiple_matches(matches)
-    picks = selector.select_picks(predictions)
-
-    print(f"\nFound {len(picks)} picks with value")
-
-    # Construir mejor parlay
     parlay = builder.build_best_parlay(picks)
     builder.display_parlay(parlay, bankroll=5000)

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python daily_bot.py:*)"
+      "Bash(python daily_bot.py:*)",
+      "Bash(python:*)"
     ],
     "deny": [],
     "ask": []

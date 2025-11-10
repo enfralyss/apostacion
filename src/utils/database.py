@@ -51,6 +51,13 @@ class BettingDatabase:
                 total_odds REAL,
                 stake REAL,
                 potential_return REAL,
+                opening_odds REAL,
+                closing_odds REAL,
+                clv_percentage REAL,
+                placed_odds REAL,
+                adjusted_stake REAL,
+                edge_at_recommendation REAL,
+                edge_at_placement REAL,
                 status TEXT DEFAULT 'pending',
                 result TEXT,
                 profit_loss REAL,
@@ -61,6 +68,20 @@ class BettingDatabase:
                 notes TEXT
             )
         ''')
+        # Intentar agregar columnas nuevas si tabla ya existía
+        for alter in [
+            "ALTER TABLE bets ADD COLUMN opening_odds REAL",
+            "ALTER TABLE bets ADD COLUMN closing_odds REAL",
+            "ALTER TABLE bets ADD COLUMN clv_percentage REAL",
+            "ALTER TABLE bets ADD COLUMN placed_odds REAL",
+            "ALTER TABLE bets ADD COLUMN adjusted_stake REAL",
+            "ALTER TABLE bets ADD COLUMN edge_at_recommendation REAL",
+            "ALTER TABLE bets ADD COLUMN edge_at_placement REAL"
+        ]:
+            try:
+                cursor.execute(alter)
+            except Exception:
+                pass
 
         # Tabla de picks individuales
         cursor.execute('''
@@ -216,8 +237,9 @@ class BettingDatabase:
         cursor.execute('''
             INSERT INTO bets (
                 bet_date, sport, bet_type, num_picks, total_odds,
-                stake, potential_return, bankroll_before, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                stake, potential_return, opening_odds, bankroll_before, notes,
+                edge_at_recommendation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             bet_data.get('bet_date', datetime.now().isoformat()),
             bet_data.get('sport', 'mixed'),
@@ -226,8 +248,10 @@ class BettingDatabase:
             bet_data.get('total_odds'),
             bet_data.get('stake'),
             bet_data.get('potential_return'),
+            bet_data.get('opening_odds', bet_data.get('total_odds')),  # abrir con total actual
             bet_data.get('bankroll_before'),
-            bet_data.get('notes', '')
+            bet_data.get('notes', ''),
+            bet_data.get('edge_at_recommendation')
         ))
 
         bet_id = cursor.lastrowid
@@ -284,6 +308,107 @@ class BettingDatabase:
 
         self.conn.commit()
         logger.info(f"Bet {bet_id} updated: {result}, P/L: ${profit_loss:.2f}")
+
+    def update_bet_closing_odds(self, bet_id: int, closing_odds: float):
+        """Actualiza closing odds y calcula CLV%"""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT opening_odds FROM bets WHERE id=?', (bet_id,))
+        row = cursor.fetchone()
+        if not row:
+            logger.warning(f"Bet {bet_id} not found for closing odds update")
+            return False
+        opening_odds = row['opening_odds'] or 0
+        if opening_odds <= 0:
+            logger.warning(f"Opening odds invalid for bet {bet_id}")
+            return False
+        clv_pct = (closing_odds / opening_odds) - 1
+        cursor.execute('''
+            UPDATE bets SET closing_odds=?, clv_percentage=? WHERE id=?
+        ''', (closing_odds, clv_pct, bet_id))
+        self.conn.commit()
+        logger.info(f"Bet {bet_id} CLV updated: closing={closing_odds} clv={clv_pct*100:.2f}%")
+        return True
+
+    def update_bet_placement(self, bet_id: int, placed_odds: float, combined_probability: Optional[float] = None) -> Optional[Dict]:
+        """Registra las odds reales a las que se colocó la apuesta y recalcula stake y edge.
+
+        Args:
+            bet_id: ID de la apuesta
+            placed_odds: Cuota final obtenida en la casa al colocar
+            combined_probability: Probabilidad combinada del parlay (si None se calcula con picks)
+
+        Returns:
+            Dict con info actualizada (placed_odds, adjusted_stake, edge_at_placement, stake_diff) o None si error
+        """
+        try:
+            self.connect()
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT total_odds, stake, edge_at_recommendation FROM bets WHERE id=?', (bet_id,))
+            bet_row = cursor.fetchone()
+            if not bet_row:
+                logger.warning(f"Bet {bet_id} not found for placement update")
+                return None
+            recommended_odds = bet_row['total_odds']
+            original_stake = bet_row['stake']
+            edge_recommendation = bet_row['edge_at_recommendation']
+
+            # Obtener probabilidad combinada si no viene
+            if combined_probability is None:
+                picks = self.get_bet_picks(bet_id)
+                combined_probability = 1.0
+                for p in picks:
+                    combined_probability *= p.get('predicted_probability', 0)
+
+            if placed_odds <= 1.0:
+                logger.warning("Placed odds inválidas")
+                return None
+
+            implied_prob_placement = 1 / placed_odds
+            edge_placement = combined_probability - implied_prob_placement
+
+            # Recalcular stake usando Kelly fraccional del StakeCalculator
+            try:
+                from src.betting.stake_calculator import StakeCalculator
+                sc = StakeCalculator()
+                stake_info = sc.calculate_recommended_stake(
+                    probability=combined_probability,
+                    odds=placed_odds,
+                    bankroll= self.get_latest_bankroll() or 0,
+                    strategy='kelly'
+                )
+                adjusted_stake = stake_info['recommended_stake']
+            except Exception as e:
+                logger.warning(f"Kelly recalculation failed: {e}")
+                adjusted_stake = original_stake
+
+            stake_diff = adjusted_stake - original_stake
+
+            cursor.execute('''
+                UPDATE bets SET placed_odds=?, adjusted_stake=?, edge_at_placement=? WHERE id=?
+            ''', (placed_odds, adjusted_stake, edge_placement, bet_id))
+            self.conn.commit()
+            logger.info(f"Bet {bet_id} placement recorded. Odds {placed_odds:.2f} (was {recommended_odds:.2f}), edge rec {edge_recommendation:.4f} -> placement {edge_placement:.4f}, stake adj {original_stake:.2f} -> {adjusted_stake:.2f}")
+            return {
+                'bet_id': bet_id,
+                'placed_odds': placed_odds,
+                'adjusted_stake': adjusted_stake,
+                'edge_at_placement': edge_placement,
+                'edge_at_recommendation': edge_recommendation,
+                'stake_diff': stake_diff,
+                'recommended_odds': recommended_odds
+            }
+        except Exception as e:
+            logger.error(f"Error updating bet placement: {e}")
+            return None
+
+    def get_latest_bankroll(self) -> Optional[float]:
+        """Retorna el último bankroll registrado (si existe)"""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT bankroll FROM bankroll_history ORDER BY created_at DESC LIMIT 1')
+        row = cursor.fetchone()
+        return row['bankroll'] if row else None
 
     def get_recent_bets(self, limit: int = 20) -> List[Dict]:
         """Obtiene las últimas apuestas"""
@@ -586,6 +711,156 @@ class BettingDatabase:
         df = df.rename(columns={'result_label': 'result'})
         logger.info(f"Training dataset real construido con {len(df)} filas")
         return df
+
+    # ------------------ ODDS HELPERS PARA CLV ------------------ #
+
+    def get_opening_odds_for_match(self, match_id: str, prediction: str) -> Optional[float]:
+        """Obtiene las primeras odds registradas para el partido según el tipo de pick.
+        prediction: 'home_win' | 'away_win' | 'draw'
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute('''SELECT home_win_odds, away_win_odds, draw_odds FROM raw_odds_snapshots
+                          WHERE match_id=? ORDER BY snapshot_time ASC LIMIT 1''', (match_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        if prediction == 'home_win':
+            return row['home_win_odds']
+        if prediction == 'away_win':
+            return row['away_win_odds']
+        if prediction == 'draw':
+            return row['draw_odds']
+        return None
+
+    def get_latest_odds_for_match(self, match_id: str, prediction: str) -> Optional[float]:
+        """Obtiene las últimas odds snapshot para el partido según tipo de pick."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute('''SELECT home_win_odds, away_win_odds, draw_odds FROM raw_odds_snapshots
+                          WHERE match_id=? ORDER BY snapshot_time DESC LIMIT 1''', (match_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        if prediction == 'home_win':
+            return row['home_win_odds']
+        if prediction == 'away_win':
+            return row['away_win_odds']
+        if prediction == 'draw':
+            return row['draw_odds']
+        return None
+
+    def get_pending_bets(self) -> List[Dict]:
+        """Devuelve apuestas pendientes (sin resultado)"""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM bets WHERE status='pending'")
+        return [dict(r) for r in cursor.fetchall()]
+
+    def get_picks_for_bet(self, bet_id: int) -> List[Dict]:
+        return self.get_bet_picks(bet_id)
+
+    def calculate_match_features(self, match: Dict) -> Optional[Dict]:
+        """
+        Calcula features para un partido nuevo usando datos históricos de la DB.
+        Retorna dict con las mismas features que usa el modelo entrenado.
+
+        Args:
+            match: Dict con 'home_team', 'away_team', 'sport', 'league', 'odds' (dict con home_win, away_win, draw)
+
+        Returns:
+            Dict con features o None si no hay suficientes datos históricos
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+
+        home_team = match['home_team']
+        away_team = match['away_team']
+        sport = match.get('sport', 'soccer')
+        odds = match.get('odds', {})
+
+        # Features basados en odds actuales
+        home_win_odds = odds.get('home_win', 0)
+        away_win_odds = odds.get('away_win', 0)
+        draw_odds = odds.get('draw', 0)
+
+        if home_win_odds == 0 or away_win_odds == 0:
+            logger.warning(f"Missing odds for {home_team} vs {away_team}")
+            return None
+
+        # Implied probabilities
+        implied_home = 1 / home_win_odds if home_win_odds > 0 else 0
+        implied_away = 1 / away_win_odds if away_win_odds > 0 else 0
+        implied_draw = 1 / draw_odds if draw_odds > 0 else 0
+
+        # Win percentage last 5 matches (from historical results)
+        cursor.execute('''
+            SELECT result_label FROM raw_match_results
+            WHERE (home_team=? OR away_team=?)
+            ORDER BY match_date DESC LIMIT 5
+        ''', (home_team, home_team))
+        recent_home = [row['result_label'] for row in cursor.fetchall()]
+
+        cursor.execute('''
+            SELECT result_label FROM raw_match_results
+            WHERE (home_team=? OR away_team=?)
+            ORDER BY match_date DESC LIMIT 5
+        ''', (away_team, away_team))
+        recent_away = [row['result_label'] for row in cursor.fetchall()]
+
+        def calculate_win_pct(results, is_home_team=True):
+            """Calculate win percentage for a team from their last results"""
+            if not results:
+                return 0.5  # Default if no history
+            wins = 0
+            for result in results:
+                if is_home_team and result == 'home_win':
+                    wins += 1
+                elif not is_home_team and result == 'away_win':
+                    wins += 1
+            return wins / len(results) if results else 0.5
+
+        win_pct_home_last5 = calculate_win_pct(recent_home, is_home_team=True)
+        win_pct_away_last5 = calculate_win_pct(recent_away, is_home_team=False)
+
+        # Rest days (placeholder - we don't have actual match dates history yet)
+        rest_days_home = 3.0
+        rest_days_away = 3.0
+
+        # Average odds last 5 matches
+        cursor.execute('''
+            SELECT home_win_odds FROM canonical_odds
+            WHERE home_team=?
+            ORDER BY match_date DESC LIMIT 5
+        ''', (home_team,))
+        avg_home_odds_rows = [row['home_win_odds'] for row in cursor.fetchall() if row['home_win_odds']]
+
+        cursor.execute('''
+            SELECT away_win_odds FROM canonical_odds
+            WHERE away_team=?
+            ORDER BY match_date DESC LIMIT 5
+        ''', (away_team,))
+        avg_away_odds_rows = [row['away_win_odds'] for row in cursor.fetchall() if row['away_win_odds']]
+
+        avg_home_odds_last5 = sum(avg_home_odds_rows) / len(avg_home_odds_rows) if avg_home_odds_rows else home_win_odds
+        avg_away_odds_last5 = sum(avg_away_odds_rows) / len(avg_away_odds_rows) if avg_away_odds_rows else away_win_odds
+
+        features = {
+            'home_win_odds': home_win_odds,
+            'away_win_odds': away_win_odds,
+            'draw_odds': draw_odds,
+            'implied_home': implied_home,
+            'implied_away': implied_away,
+            'implied_draw': implied_draw,
+            'win_pct_home_last5': win_pct_home_last5,
+            'win_pct_away_last5': win_pct_away_last5,
+            'rest_days_home': rest_days_home,
+            'rest_days_away': rest_days_away,
+            'avg_home_odds_last5': avg_home_odds_last5,
+            'avg_away_odds_last5': avg_away_odds_last5
+        }
+
+        return features
 
 
 if __name__ == "__main__":

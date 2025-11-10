@@ -1,21 +1,28 @@
 {
-  "train_accuracy": 1.0,
-  "test_accuracy": 0.5075,
-  "cv_accuracy_mean": 0.5225,
-  "cv_accuracy_std": 0.03305298776207684,
-  "log_loss": 0.8601669544574903,
-  "auc_ovr": null,
+  "train_accuracy": 0.8452722063037249,
+  "test_accuracy": 0.5071633237822349,
+  "cv_accuracy_mean": 0.47048710601719196,
+  "cv_accuracy_std": 0.018516325984416635,
+  "log_loss": 1.1035774188599459,
+  "auc_ovr": 0.6334607772243629,
   "confusion_matrix": [
     [
-      51,
-      120
+      59,
+      16,
+      38
     ],
     [
-      77,
-      152
+      24,
+      17,
+      45
+    ],
+    [
+      23,
+      26,
+      101
     ]
   ],
-  "dataset_hash": "1658aac08e871cc31fdc3139db6faa6f",
-  "dataset_rows": 2000,
-  "dataset_cols": 21
+  "dataset_hash": "72d42239c3a5eaa63fd028aa8609ce53",
+  "dataset_rows": 1745,
+  "dataset_cols": 19
 }

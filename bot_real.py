@@ -56,6 +56,13 @@ class RealBettingBot:
         print(f"Bankroll: VES {self.bankroll:,.2f}")
         print("="*70)
 
+        # DEBUG: Mostrar criterios cargados
+        print(f"\nCriterios de selección cargados:")
+        print(f"  - min_probability: {self.selector.pick_criteria['min_probability']*100:.0f}%")
+        print(f"  - min_edge: {self.selector.pick_criteria['min_edge']*100:.0f}%")
+        print(f"  - min_odds: {self.selector.pick_criteria['min_odds']}")
+        print(f"  - max_odds: {self.selector.pick_criteria['max_odds']}")
+
         # 1. Verificar API
         print("\nVerificando API...")
         status = self.odds_fetcher.check_api_status()
@@ -66,16 +73,17 @@ class RealBettingBot:
 
         print(f"API OK - Requests restantes: {status.get('requests_remaining', 'unknown')}")
 
-        # 2. Obtener partidos REALES
-        print("\nObteniendo partidos reales...")
+        # 2. Obtener partidos REALES (modo solo fútbol)
+        print("\nObteniendo partidos reales (SOCCER ONLY MODE)...")
         print("   - Champions League")
         print("   - La Liga")
         print("   - Premier League")
         print("   - Serie A")
         print("   - Bundesliga")
-        print("   - NBA")
+        print("   - Europa League")
 
-        matches = self.odds_fetcher.get_available_matches("all")
+        # Solo soccer (API multi-deporte queda para futura extensión)
+        matches = self.odds_fetcher.get_available_matches("soccer")
 
         if not matches:
             print("ERROR - No se encontraron partidos")
@@ -94,13 +102,28 @@ class RealBettingBot:
         predictions = self.predictor.predict_multiple_matches(matches)
         print(f"OK - {len(predictions)} predicciones generadas")
 
+        if len(predictions) == 0:
+            print("\n⚠️  WARNING: No se generaron predicciones del modelo ML")
+            print("Posibles causas:")
+            print("  1. Modelo no cargado correctamente")
+            print("  2. Error en features del modelo")
+            print("  3. Incompatibilidad entre datos y modelo")
+            print("\nRevisa logs/triunfobet_bot.log para detalles del error")
+            return {'success': False, 'error': 'Model failed to generate predictions'}
+
         # 4. Seleccionar picks con valor
-        print("\nBuscando picks con valor (edge > 5%)...")
+        # Leer criterios dinámicamente del config
+        min_prob = self.selector.pick_criteria['min_probability']
+        min_edge = self.selector.pick_criteria['min_edge']
+        min_odds = self.selector.pick_criteria['min_odds']
+        max_odds = self.selector.pick_criteria['max_odds']
+
+        print(f"\nBuscando picks con valor (edge > {min_edge*100:.0f}%)...")
         picks = self.selector.select_picks(predictions)
 
         if not picks:
             print("\nNO SE ENCONTRARON PICKS CON VALOR HOY")
-            print("Criterios: Probabilidad > 65%, Edge > 5%, Odds 1.50-2.20")
+            print(f"Criterios: Probabilidad > {min_prob*100:.0f}%, Edge > {min_edge*100:.0f}%, Odds {min_odds}-{max_odds}")
             print("\nMejor no apostar hoy que forzar apuestas sin ventaja")
             return {
                 'success': True,
@@ -133,19 +156,37 @@ class RealBettingBot:
         # 7. Mostrar recomendación
         self._display_recommendation(parlay, stake, potential_return, potential_profit)
 
-        # 8. Guardar en base de datos
+        # 8. Guardar en base de datos (sport= 'soccer' en modo enfocado)
         bet_data = {
             'bet_date': datetime.now().isoformat(),
-            'sport': 'mixed',
+            'sport': 'soccer',
             'bet_type': 'parlay',
             'total_odds': parlay['total_odds'],
             'stake': stake,
             'potential_return': potential_return,
+            'opening_odds': parlay['total_odds'],  # registra la cuota al crear la apuesta
+            'edge_at_recommendation': parlay.get('edge'),
             'bankroll_before': self.bankroll,
             'notes': 'Manual placement - Real data'
         }
 
         bet_id = self.db.save_bet(bet_data, parlay['picks'])
+
+        # Registrar odds por pick en CLV tracking (opening vs bet odds iguales inicialmente)
+        try:
+            from src.utils.clv_tracker import CLVTracker
+            clv = CLVTracker()
+            for pick in parlay['picks']:
+                clv.save_bet_odds(
+                    bet_id=bet_id,
+                    match_id=pick.get('match_id', ''),
+                    sport='soccer',
+                    opening_odds=pick.get('odds'),
+                    bet_odds=pick.get('odds')
+                )
+            clv.close()
+        except Exception as e:
+            logger.warning(f"No se pudo registrar CLV inicial para bet {bet_id}: {e}")
         print(f"\nRecomendación guardada (ID: {bet_id})")
 
         # 9. Enviar notificación

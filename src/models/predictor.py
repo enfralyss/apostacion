@@ -6,7 +6,7 @@ import pandas as pd
 from typing import Dict
 from loguru import logger
 from src.models.train_model import BettingModel
-from src.scrapers.stats_collector import StatsCollector
+from src.utils.database import BettingDatabase
 
 
 class MatchPredictor:
@@ -33,14 +33,16 @@ class MatchPredictor:
             logger.warning(f"NBA model not found at {nba_model_path}")
             self.nba_model = None
 
-        self.stats_collector = StatsCollector(use_mock=True)
+        # Use database for feature calculation (same as training)
+        self.db = BettingDatabase()
 
     def predict_match(self, match: Dict) -> Dict:
         """
-        Predice el resultado de un partido
+        Predice el resultado de un partido usando features de la base de datos
 
         Args:
-            match: Diccionario con información del partido (de triunfobet_scraper)
+            match: Diccionario con información del partido (de API)
+                   Debe incluir: home_team, away_team, sport, league, match_date, odds
 
         Returns:
             Diccionario con predicciones y probabilidades
@@ -51,44 +53,6 @@ class MatchPredictor:
 
         logger.info(f"Predicting: {home_team} vs {away_team} ({sport})")
 
-        # Obtener estadísticas de equipos
-        home_stats = self.stats_collector.get_team_stats(home_team, sport)
-        away_stats = self.stats_collector.get_team_stats(away_team, sport)
-
-        # Obtener H2H
-        h2h = self.stats_collector.get_head_to_head(home_team, away_team, sport)
-
-        # Calcular features para ambos equipos
-        home_features = self.stats_collector.calculate_team_features(home_stats, is_home=True)
-        away_features = self.stats_collector.calculate_team_features(away_stats, is_home=False)
-
-        # Crear DataFrame de features
-        features_dict = {}
-
-        # Agregar features del equipo local con prefijo 'home_'
-        for key, value in home_features.items():
-            features_dict[f'home_{key}'] = value
-
-        # Agregar features del equipo visitante con prefijo 'away_'
-        for key, value in away_features.items():
-            features_dict[f'away_{key}'] = value
-
-        # Agregar H2H
-        features_dict['h2h_home_win_rate'] = h2h['team1_win_rate']
-
-        # Calcular diferencial de estadísticas
-        if sport == "soccer":
-            stat_diff = (home_features['goals_scored_avg'] - home_features['goals_conceded_avg']) - \
-                       (away_features['goals_scored_avg'] - away_features['goals_conceded_avg'])
-        else:  # NBA
-            stat_diff = (home_features['points_scored_avg'] - home_features['points_conceded_avg']) - \
-                       (away_features['points_scored_avg'] - away_features['points_conceded_avg'])
-
-        features_dict['stat_differential'] = stat_diff
-
-        # Convertir a DataFrame
-        features_df = pd.DataFrame([features_dict])
-
         # Seleccionar modelo
         model = self.soccer_model if sport == "soccer" else self.nba_model
 
@@ -98,6 +62,19 @@ class MatchPredictor:
                 'error': f'Model for {sport} not available',
                 'probabilities': {}
             }
+
+        # Calcular features usando el mismo método que en training
+        features_dict = self.db.calculate_match_features(match)
+
+        if features_dict is None:
+            logger.warning(f"Could not calculate features for {home_team} vs {away_team}")
+            return {
+                'error': 'Could not calculate features',
+                'probabilities': {}
+            }
+
+        # Convertir a DataFrame
+        features_df = pd.DataFrame([features_dict])
 
         # Predecir
         probabilities = model.predict_proba(features_df)
@@ -134,14 +111,31 @@ class MatchPredictor:
             Lista de predicciones
         """
         predictions = []
+        errors = []
 
         for match in matches:
             try:
                 prediction = self.predict_match(match)
+
+                # Skip if prediction contains error
+                if 'error' in prediction:
+                    errors.append(f"{match.get('match_id')}: {prediction['error']}")
+                    continue
+
                 predictions.append(prediction)
             except Exception as e:
-                logger.error(f"Error predicting match {match.get('match_id')}: {e}")
+                import traceback
+                error_msg = f"{match.get('match_id')}: {str(e)}\n{traceback.format_exc()}"
+                logger.error(f"Error predicting match: {error_msg}")
+                errors.append(str(e))
                 continue
+
+        # Log summary
+        if errors:
+            logger.warning(f"Prediction errors summary: {len(errors)} failures out of {len(matches)} matches")
+            logger.warning(f"First error: {errors[0]}")
+
+        logger.info(f"Successfully predicted {len(predictions)} out of {len(matches)} matches")
 
         return predictions
 

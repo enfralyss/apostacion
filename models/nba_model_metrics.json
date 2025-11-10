@@ -1,21 +1,21 @@
 {
-  "train_accuracy": 1.0,
-  "test_accuracy": 0.5825,
-  "cv_accuracy_mean": 0.5860000000000001,
-  "cv_accuracy_std": 0.014370107863199911,
-  "log_loss": 0.8056577357127546,
+  "train_accuracy": 0.889375,
+  "test_accuracy": 0.625,
+  "cv_accuracy_mean": 0.605,
+  "cv_accuracy_std": 0.02770379035439011,
+  "log_loss": 0.6900480695312138,
   "auc_ovr": null,
   "confusion_matrix": [
     [
-      22,
-      122
+      24,
+      120
     ],
     [
-      45,
-      211
+      30,
+      226
     ]
   ],
-  "dataset_hash": "c1d79f2b73784a99eeff7f948a5b0f03",
+  "dataset_hash": "806fb6e7bd58e1652c6342f656405db2",
   "dataset_rows": 2000,
   "dataset_cols": 25
 }

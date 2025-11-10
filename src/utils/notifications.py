@@ -10,59 +10,91 @@ from loguru import logger
 
 
 class TelegramNotifier:
-    """Enviador de notificaciones vía Telegram"""
+    """
+    Enviador de notificaciones vía Telegram
+    Soporta envío a múltiples usuarios (broadcast)
+    """
 
-    def __init__(self, bot_token: str = None, chat_id: str = None):
+    def __init__(self, bot_token: str = None, chat_ids: List[str] = None):
         """
         Args:
             bot_token: Token del bot de Telegram
-            chat_id: ID del chat para enviar mensajes
+            chat_ids: Lista de chat IDs o string separado por comas
         """
         self.bot_token = bot_token or os.getenv('TELEGRAM_BOT_TOKEN')
-        self.chat_id = chat_id or os.getenv('TELEGRAM_CHAT_ID')
-        self.enabled = bool(self.bot_token and self.chat_id)
+
+        # Soportar tanto lista como string separado por comas
+        if chat_ids:
+            if isinstance(chat_ids, list):
+                self.chat_ids = chat_ids
+            else:
+                self.chat_ids = [c.strip() for c in str(chat_ids).split(',') if c.strip()]
+        else:
+            # Intentar cargar desde variable de entorno (soporta pool)
+            chat_ids_env = os.getenv('TELEGRAM_CHAT_IDS', '') or os.getenv('TELEGRAM_CHAT_ID', '')
+            self.chat_ids = [c.strip() for c in chat_ids_env.split(',') if c.strip()]
+
+        self.enabled = bool(self.bot_token and self.chat_ids)
 
         if not self.enabled:
             logger.warning("Telegram notifications disabled - missing credentials")
+        else:
+            logger.info(f"Telegram notifier initialized for {len(self.chat_ids)} recipients")
 
-    def send_message(self, message: str) -> bool:
+    def send_message(self, message: str, chat_id: str = None) -> bool:
         """
-        Envía un mensaje de texto
+        Envía un mensaje de texto (broadcast a todos los usuarios o a uno específico)
 
         Args:
             message: Mensaje a enviar
+            chat_id: Chat ID específico (opcional). Si no se provee, envía a todos
 
         Returns:
-            True si se envió exitosamente
+            True si se envió exitosamente a al menos un usuario
         """
         if not self.enabled:
             logger.debug("Telegram disabled, message not sent")
             return False
 
-        try:
-            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            data = {
-                'chat_id': self.chat_id,
-                'text': message,
-                'parse_mode': 'Markdown',
-                'disable_web_page_preview': True
-            }
-            
-            response = requests.post(url, data=data, timeout=10)
-            
-            if response.status_code == 200:
-                logger.info(f"[TELEGRAM] Message sent successfully")
-                return True
-            else:
-                logger.error(f"[TELEGRAM] Failed to send: {response.status_code} - {response.text}")
-                return False
+        # Determinar a quién enviar
+        target_chats = [chat_id] if chat_id else self.chat_ids
 
-        except Exception as e:
-            logger.error(f"Error sending Telegram message: {e}")
+        success_count = 0
+        fail_count = 0
+
+        for chat in target_chats:
+            try:
+                url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+                data = {
+                    'chat_id': chat,
+                    'text': message,
+                    'parse_mode': 'Markdown',
+                    'disable_web_page_preview': True
+                }
+
+                response = requests.post(url, data=data, timeout=10)
+
+                if response.status_code == 200:
+                    logger.debug(f"[TELEGRAM] Message sent to {chat[:8]}...")
+                    success_count += 1
+                else:
+                    logger.warning(f"[TELEGRAM] Failed to send to {chat[:8]}: {response.status_code}")
+                    fail_count += 1
+
+            except Exception as e:
+                logger.error(f"Error sending Telegram message to {chat[:8]}: {e}")
+                fail_count += 1
+
+        # Retornar True si al menos uno fue exitoso
+        if success_count > 0:
+            logger.info(f"[TELEGRAM] Broadcast sent: {success_count} successful, {fail_count} failed")
+            return True
+        else:
+            logger.error(f"[TELEGRAM] Broadcast failed completely: {fail_count} failures")
             return False
 
     def send_daily_picks(self, picks: List[Dict], parlay: Dict, stake: float,
-                        bankroll: float) -> bool:
+                        bankroll: float, clv_stats: Dict = None) -> bool:
         """
         Envía notificación con los picks del día
 
@@ -71,6 +103,7 @@ class TelegramNotifier:
             parlay: Información del parlay
             stake: Monto a apostar
             bankroll: Bankroll actual
+            clv_stats: Estadísticas de CLV (opcional)
 
         Returns:
             True si se envió exitosamente
@@ -105,9 +138,54 @@ class TelegramNotifier:
         message += f"💼 *Bankroll:* ${bankroll:.2f}\n"
         message += f"📊 *% del Bankroll:* {stake/bankroll*100:.1f}%\n\n"
 
+        # Agregar CLV stats si están disponibles
+        if clv_stats and clv_stats.get('total_bets', 0) > 10:
+            message += "📈 *CLV Performance*\n"
+            message += f"   CLV Promedio: {clv_stats['avg_clv_percentage']:.2f}%\n"
+            message += f"   Tasa Positivos: {clv_stats['positive_clv_rate']:.1f}%\n"
+            
+            # Badge según performance CLV
+            avg_clv = clv_stats['avg_clv_percentage']
+            if avg_clv > 5:
+                message += "   Rating: ⭐⭐⭐⭐⭐ ELITE\n"
+            elif avg_clv > 3:
+                message += "   Rating: ⭐⭐⭐⭐ SHARP\n"
+            elif avg_clv > 1:
+                message += "   Rating: ⭐⭐⭐ BUENO\n"
+            elif avg_clv > -1:
+                message += "   Rating: ⭐⭐ NEUTRO\n"
+            else:
+                message += "   Rating: ⭐ NEGATIVO\n"
+            message += "\n"
+
         message += "✅ *Apuesta lista para colocar*"
 
         return self.send_message(message)
+
+    def send_placement_update(self, placement_info: Dict) -> bool:
+        """Envía notificación cuando se registra la colocación real de una apuesta.
+
+        Args:
+            placement_info: Dict retornado por update_bet_placement
+
+        Returns:
+            True si se envía al menos a un destinatario
+        """
+        if not placement_info:
+            return False
+        msg = "📝 *PLACEMENT UPDATE*\n\n"
+        msg += f"Apuesta ID: {placement_info['bet_id']}\n"
+        rec_odds = placement_info.get('recommended_odds')
+        if rec_odds:
+            msg += f"Cuota recomendada: {rec_odds:.2f}\n"
+        msg += f"Cuota colocada: {placement_info['placed_odds']:.2f}\n"
+        msg += f"Stake ajustado: {placement_info['adjusted_stake']:.2f}\n"
+        msg += f"Edge recomendado: {placement_info['edge_at_recommendation']*100:.2f}%\n"
+        msg += f"Edge al placement: {placement_info['edge_at_placement']*100:.2f}%\n"
+        stake_diff = placement_info.get('stake_diff', 0)
+        if stake_diff != 0:
+            msg += f"Δ Stake: {stake_diff:+.2f}\n"
+        return self.send_message(msg)
 
     def send_bet_result(self, bet_result: str, profit_loss: float,
                        new_bankroll: float, win_rate: float) -> bool:
