@@ -7,8 +7,16 @@ import numpy as np
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBClassifier
+try:
+    from xgboost import XGBClassifier  # type: ignore
+except Exception:
+    XGBClassifier = None  # Fallback si no está disponible XGBoost
 from sklearn.metrics import accuracy_score, classification_report, log_loss
+try:
+    from sklearn.metrics import roc_auc_score, confusion_matrix  # type: ignore
+except Exception:
+    roc_auc_score = None
+    confusion_matrix = None
 import pickle
 import os
 from loguru import logger
@@ -40,8 +48,9 @@ class BettingModel:
         """
         logger.info(f"Training {self.model_type} model for {self.sport}")
 
-        # Separar features y target
+        # Separar features y target (usar solo columnas numéricas para evitar objetos)
         X = data.drop('result', axis=1)
+        X = X.select_dtypes(include=[np.number])
         y = data['result']
 
         self.feature_columns = X.columns.tolist()
@@ -56,14 +65,20 @@ class BettingModel:
         )
 
         # Inicializar modelo
-        if self.model_type == "xgboost":
+        if self.model_type == "xgboost" and XGBClassifier is not None:
             self.model = XGBClassifier(
                 n_estimators=200,
                 max_depth=6,
                 learning_rate=0.1,
                 random_state=42,
-                eval_metric='mlogloss',
-                enable_categorical=True  # Permitir strings como labels
+                eval_metric='mlogloss'
+            )
+        elif self.model_type == "xgboost" and XGBClassifier is None:
+            logger.warning("XGBoost no disponible en el entorno. Usando GradientBoostingClassifier como fallback.")
+            self.model = GradientBoostingClassifier(
+                n_estimators=200,
+                learning_rate=0.1,
+                random_state=42
             )
         elif self.model_type == "random_forest":
             self.model = RandomForestClassifier(
@@ -74,7 +89,6 @@ class BettingModel:
         else:  # gradient_boosting
             self.model = GradientBoostingClassifier(
                 n_estimators=200,
-                max_depth=6,
                 learning_rate=0.1,
                 random_state=42
             )
@@ -116,12 +130,31 @@ class BettingModel:
         logloss = log_loss(y_test, test_proba)
         logger.info(f"Log Loss: {logloss:.4f}")
 
+        # AUC multi-clase (OVR) si está disponible
+        auc_ovr = None
+        if roc_auc_score is not None:
+            try:
+                auc_ovr = float(roc_auc_score(y_test, test_proba, multi_class='ovr'))
+                logger.info(f"AUC (OVR): {auc_ovr:.4f}")
+            except Exception as e:
+                logger.warning(f"No se pudo calcular AUC OVR: {e}")
+
+        # Matriz de confusión si disponible
+        cm = None
+        if confusion_matrix is not None:
+            try:
+                cm = confusion_matrix(y_test, test_preds)
+            except Exception as e:
+                logger.warning(f"No se pudo calcular matriz de confusión: {e}")
+
         return {
             'train_accuracy': train_acc,
             'test_accuracy': test_acc,
             'cv_accuracy_mean': cv_scores.mean(),
             'cv_accuracy_std': cv_scores.std(),
-            'log_loss': logloss
+            'log_loss': logloss,
+            'auc_ovr': auc_ovr,
+            'confusion_matrix': cm.tolist() if cm is not None else None
         }
 
     def predict_proba(self, features: pd.DataFrame) -> dict:
@@ -197,6 +230,10 @@ class BettingModel:
 def train_all_models():
     """Entrena modelos para soccer y NBA"""
     from src.utils.data_generator import generate_training_data
+    from src.utils.database import BettingDatabase
+    import json
+    import hashlib
+    db = BettingDatabase()
 
     # Crear directorio de datos si no existe
     os.makedirs("data", exist_ok=True)
@@ -207,20 +244,107 @@ def train_all_models():
     logger.info("TRAINING SOCCER MODEL")
     logger.info("=" * 50)
 
-    soccer_data = generate_training_data("soccer", num_matches=2000)
+    # Preferir dataset real si existe con suficiente tamaño
+    real_soccer_csv = "data/training_real_soccer.csv"
+    if os.path.exists(real_soccer_csv):
+        try:
+            soccer_data = pd.read_csv(real_soccer_csv)
+            logger.info(f"Loaded real soccer dataset: {len(soccer_data)} rows")
+        except Exception as e:
+            logger.warning(f"No se pudo cargar dataset real de soccer, usando sintético. Error: {e}")
+            soccer_data = generate_training_data("soccer", num_matches=2000)
+    else:
+        soccer_data = generate_training_data("soccer", num_matches=2000)
     soccer_model = BettingModel(sport="soccer", model_type="xgboost")
     soccer_metrics = soccer_model.train(soccer_data, validation_split=0.2)
     soccer_model.save("models/soccer_model.pkl")
+    # Hash y tamaño de dataset
+    soccer_csv = soccer_data.to_csv(index=False).encode('utf-8')
+    soccer_hash = hashlib.md5(soccer_csv).hexdigest()
+    soccer_rows, soccer_cols = soccer_data.shape
+    with open("models/soccer_model_metrics.json", 'w') as f:
+        json.dump({**soccer_metrics, 'dataset_hash': soccer_hash, 'dataset_rows': soccer_rows, 'dataset_cols': soccer_cols}, f, indent=2)
+    # Guardar resumen en DB (tabla model_registry pendiente de creación si no existe)
+    try:
+        db.connect()
+        cursor = db.conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS model_registry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sport TEXT,
+                model_type TEXT,
+                test_accuracy REAL,
+                train_accuracy REAL,
+                cv_mean REAL,
+                cv_std REAL,
+                log_loss REAL,
+                auc_ovr REAL,
+                dataset_hash TEXT,
+                dataset_rows INTEGER,
+                dataset_cols INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Intentar agregar columnas nuevas si la tabla ya existía
+        for stmt in [
+            "ALTER TABLE model_registry ADD COLUMN auc_ovr REAL",
+            "ALTER TABLE model_registry ADD COLUMN dataset_hash TEXT",
+            "ALTER TABLE model_registry ADD COLUMN dataset_rows INTEGER",
+            "ALTER TABLE model_registry ADD COLUMN dataset_cols INTEGER",
+        ]:
+            try:
+                cursor.execute(stmt)
+            except Exception:
+                pass
+        cursor.execute("""
+            INSERT INTO model_registry (sport, model_type, test_accuracy, train_accuracy, cv_mean, cv_std, log_loss, auc_ovr, dataset_hash, dataset_rows, dataset_cols)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            'soccer', 'xgboost', soccer_metrics['test_accuracy'], soccer_metrics['train_accuracy'],
+            soccer_metrics['cv_accuracy_mean'], soccer_metrics['cv_accuracy_std'], soccer_metrics['log_loss'],
+            soccer_metrics.get('auc_ovr'), soccer_hash, soccer_rows, soccer_cols
+        ))
+        db.conn.commit()
+    except Exception as e:
+        logger.error(f"Error saving soccer model metrics to DB: {e}")
 
     # NBA Model
     logger.info("\n" + "=" * 50)
     logger.info("TRAINING NBA MODEL")
     logger.info("=" * 50)
 
-    nba_data = generate_training_data("nba", num_matches=2000)
+    real_nba_csv = "data/training_real_nba.csv"
+    if os.path.exists(real_nba_csv):
+        try:
+            nba_data = pd.read_csv(real_nba_csv)
+            logger.info(f"Loaded real NBA dataset: {len(nba_data)} rows")
+        except Exception as e:
+            logger.warning(f"No se pudo cargar dataset real de NBA, usando sintético. Error: {e}")
+            nba_data = generate_training_data("nba", num_matches=2000)
+    else:
+        nba_data = generate_training_data("nba", num_matches=2000)
     nba_model = BettingModel(sport="nba", model_type="xgboost")
     nba_metrics = nba_model.train(nba_data, validation_split=0.2)
     nba_model.save("models/nba_model.pkl")
+    nba_csv = nba_data.to_csv(index=False).encode('utf-8')
+    nba_hash = hashlib.md5(nba_csv).hexdigest()
+    nba_rows, nba_cols = nba_data.shape
+    with open("models/nba_model_metrics.json", 'w') as f:
+        json.dump({**nba_metrics, 'dataset_hash': nba_hash, 'dataset_rows': nba_rows, 'dataset_cols': nba_cols}, f, indent=2)
+    try:
+        cursor.execute("""
+            INSERT INTO model_registry (sport, model_type, test_accuracy, train_accuracy, cv_mean, cv_std, log_loss, auc_ovr, dataset_hash, dataset_rows, dataset_cols)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            'nba', 'xgboost', nba_metrics['test_accuracy'], nba_metrics['train_accuracy'],
+            nba_metrics['cv_accuracy_mean'], nba_metrics['cv_accuracy_std'], nba_metrics['log_loss'],
+            nba_metrics.get('auc_ovr'), nba_hash, nba_rows, nba_cols
+        ))
+        db.conn.commit()
+    except Exception as e:
+        logger.error(f"Error saving NBA model metrics to DB: {e}")
+    finally:
+        db.close()
 
     # Summary
     logger.info("\n" + "=" * 50)

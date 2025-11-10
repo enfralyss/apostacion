@@ -1,0 +1,21 @@
+{
+  "train_accuracy": 1.0,
+  "test_accuracy": 0.5075,
+  "cv_accuracy_mean": 0.5225,
+  "cv_accuracy_std": 0.03305298776207684,
+  "log_loss": 0.8601669544574903,
+  "auc_ovr": null,
+  "confusion_matrix": [
+    [
+      51,
+      120
+    ],
+    [
+      77,
+      152
+    ]
+  ],
+  "dataset_hash": "1658aac08e871cc31fdc3139db6faa6f",
+  "dataset_rows": 2000,
+  "dataset_cols": 21
+}

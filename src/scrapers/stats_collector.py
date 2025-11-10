@@ -218,7 +218,7 @@ class StatsCollector:
             features = {
                 "win_rate_last_10": team_stats["wins_last_10"] / 10,
                 "form_last_5": team_stats["form_last_5"] / 3.0,  # Normalizado (max 3 pts)
-                "home_away_win_rate": (
+                "win_rate": (
                     team_stats["home_wins"] / max(1, team_stats["home_wins"] + team_stats["home_draws"] + team_stats["home_losses"])
                     if is_home else
                     team_stats["away_wins"] / max(1, team_stats["away_wins"] + team_stats["away_draws"] + team_stats["away_losses"])
@@ -237,7 +237,7 @@ class StatsCollector:
             features = {
                 "win_rate_last_10": team_stats["wins_last_10"] / 10,
                 "form_last_5": team_stats["form_last_5"] / 5.0,
-                "home_away_win_rate": (
+                "win_rate": (
                     team_stats["home_wins"] / max(1, team_stats["home_wins"] + team_stats["home_losses"])
                     if is_home else
                     team_stats["away_wins"] / max(1, team_stats["away_wins"] + team_stats["away_losses"])

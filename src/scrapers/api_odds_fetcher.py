@@ -8,7 +8,11 @@ import requests
 from typing import List, Dict
 from datetime import datetime
 from loguru import logger
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:
+    def load_dotenv(*args, **kwargs):  # type: ignore
+        return None
 
 load_dotenv()
 
@@ -172,6 +176,7 @@ class OddsAPIFetcher:
                 'home_team': home_team,
                 'away_team': away_team,
                 'match_date': commence_time,
+                'bookmakers_count': len(bookmakers),
                 'odds': {
                     'home_win': round(home_odds, 2),
                     'away_win': round(away_odds, 2)
@@ -215,6 +220,150 @@ class OddsAPIFetcher:
 
         except Exception as e:
             return {'status': 'error', 'message': str(e)}
+
+    def fetch_scores(self, sport: str = "all", days_from: int = 3) -> List[Dict]:
+        """
+        Obtiene scores/resultados finales de partidos recientes
+
+        Args:
+            sport: 'soccer', 'basketball', o 'all'
+            days_from: días hacia atrás para consultar (default 3)
+
+        Returns:
+            Lista de partidos con scores finales
+        """
+        if not self.api_key:
+            logger.error("API key not configured")
+            return []
+
+        scores = []
+
+        try:
+            if sport in ["soccer", "all"]:
+                # Champions League
+                scores.extend(self._fetch_sport_scores("soccer_uefa_champs_league", "Champions League"))
+                # La Liga
+                scores.extend(self._fetch_sport_scores("soccer_spain_la_liga", "La Liga"))
+                # Premier League
+                scores.extend(self._fetch_sport_scores("soccer_epl", "Premier League"))
+                # Serie A
+                scores.extend(self._fetch_sport_scores("soccer_italy_serie_a", "Serie A"))
+                # Bundesliga
+                scores.extend(self._fetch_sport_scores("soccer_germany_bundesliga", "Bundesliga"))
+
+            if sport in ["basketball", "all"]:
+                # NBA
+                scores.extend(self._fetch_sport_scores("basketball_nba", "NBA"))
+
+        except Exception as e:
+            logger.error(f"Error fetching scores: {e}")
+
+        logger.info(f"Fetched {len(scores)} match scores")
+        return scores
+
+    def _fetch_sport_scores(self, sport_key: str, league_name: str) -> List[Dict]:
+        """
+        Fetch scores para un deporte específico
+
+        Args:
+            sport_key: Key del deporte en The Odds API
+            league_name: Nombre de la liga
+
+        Returns:
+            Lista de partidos con scores
+        """
+        scores = []
+
+        try:
+            url = f"{self.base_url}/sports/{sport_key}/scores"
+
+            params = {
+                'apiKey': self.api_key,
+                'daysFrom': 3,  # Últimos 3 días
+                'dateFormat': 'iso'
+            }
+
+            response = requests.get(url, params=params, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+
+                logger.info(f"Fetched {len(data)} completed matches from {league_name}")
+
+                for event in data:
+                    # Solo procesar partidos completados
+                    if not event.get('completed'):
+                        continue
+
+                    score = self._parse_score(event, sport_key, league_name)
+                    if score:
+                        scores.append(score)
+
+            elif response.status_code == 401:
+                logger.error("Invalid API key")
+            elif response.status_code == 429:
+                logger.error("API rate limit exceeded")
+            else:
+                logger.warning(f"API returned status {response.status_code} for {league_name}")
+
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout fetching scores for {league_name}")
+        except Exception as e:
+            logger.error(f"Error fetching scores for {league_name}: {e}")
+
+        return scores
+
+    def _parse_score(self, event: dict, sport_key: str, league_name: str) -> Dict:
+        """Parse un score de la API a nuestro formato"""
+
+        try:
+            home_team = event['home_team']
+            away_team = event['away_team']
+            match_date = event['commence_time']
+
+            # Obtener scores
+            scores = event.get('scores')
+            if not scores:
+                return None
+
+            home_score = None
+            away_score = None
+
+            for score in scores:
+                if score['name'] == home_team:
+                    home_score = int(score['score'])
+                elif score['name'] == away_team:
+                    away_score = int(score['score'])
+
+            if home_score is None or away_score is None:
+                return None
+
+            # Determinar resultado
+            if home_score > away_score:
+                result_label = 'home_win'
+            elif away_score > home_score:
+                result_label = 'away_win'
+            else:
+                result_label = 'draw'
+
+            is_soccer = 'soccer' in sport_key
+
+            return {
+                'match_id': event['id'],
+                'sport': 'soccer' if is_soccer else 'nba',
+                'league': league_name,
+                'home_team': home_team,
+                'away_team': away_team,
+                'match_date': match_date,
+                'home_score': home_score,
+                'away_score': away_score,
+                'result_label': result_label,
+                'completed': True
+            }
+
+        except Exception as e:
+            logger.debug(f"Error parsing score: {e}")
+            return None
 
 
 class FootballDataAPI:

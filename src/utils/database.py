@@ -113,6 +113,89 @@ class BettingDatabase:
             )
         ''')
 
+        # Snapshot de odds crudas provenientes de la API
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS raw_odds_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id TEXT,
+                sport TEXT,
+                league TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                match_date TEXT,
+                snapshot_time TEXT DEFAULT CURRENT_TIMESTAMP,
+                bookmakers_count INTEGER,
+                home_win_odds REAL,
+                away_win_odds REAL,
+                draw_odds REAL,
+                source TEXT DEFAULT 'the_odds_api'
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_raw_odds_match ON raw_odds_snapshots(match_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_raw_odds_snapshot_time ON raw_odds_snapshots(snapshot_time)')
+
+        # Resultados finales del partido (stub: se puede ampliar con marcadores)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS raw_match_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id TEXT,
+                sport TEXT,
+                league TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                match_date TEXT,
+                result_label TEXT,  -- 'home_win','away_win','draw'
+                home_score INTEGER,
+                away_score INTEGER,
+                result_time TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_results_match ON raw_match_results(match_id)')
+
+        # Odds canónicas (último snapshot antes de inicio + sin margen)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS canonical_odds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id TEXT UNIQUE,
+                sport TEXT,
+                league TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                match_date TEXT,
+                snapshot_time TEXT,
+                home_win_odds REAL,
+                away_win_odds REAL,
+                draw_odds REAL,
+                implied_home REAL,
+                implied_away REAL,
+                implied_draw REAL,
+                margin REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_canonical_match ON canonical_odds(match_id)')
+
+        # Features ingenierizados por partido
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS engineered_features (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id TEXT UNIQUE,
+                sport TEXT,
+                league TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                match_date TEXT,
+                win_pct_home_last5 REAL,
+                win_pct_away_last5 REAL,
+                rest_days_home REAL,
+                rest_days_away REAL,
+                avg_home_odds_last5 REAL,
+                avg_away_odds_last5 REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_feat_match ON engineered_features(match_id)')
+
         self.conn.commit()
         logger.info("Database tables created/verified")
 
@@ -313,6 +396,196 @@ class BettingDatabase:
         history = [dict(row) for row in rows]
 
         return history
+
+    # ------------------ INGESTION & NORMALIZATION ------------------ #
+
+    def save_odds_snapshot(self, matches: List[Dict]):
+        """Guarda un snapshot de odds provenientes de la API.
+
+        Args:
+            matches: lista de dicts devueltos por OddsAPIFetcher.get_available_matches
+        """
+        if not matches:
+            return 0
+        self.connect()
+        cursor = self.conn.cursor()
+        inserted = 0
+        for m in matches:
+            try:
+                odds = m.get('odds', {})
+                cursor.execute('''
+                    INSERT INTO raw_odds_snapshots (
+                        match_id,sport,league,home_team,away_team,match_date,bookmakers_count,
+                        home_win_odds,away_win_odds,draw_odds,source
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ''', (
+                    m.get('match_id'), m.get('sport'), m.get('league'), m.get('home_team'), m.get('away_team'),
+                    m.get('match_date'), m.get('bookmakers_count', 0),
+                    odds.get('home_win'), odds.get('away_win'), odds.get('draw'), 'the_odds_api'
+                ))
+                inserted += 1
+            except Exception as e:
+                logger.warning(f"No se pudo insertar snapshot para match {m.get('match_id')}: {e}")
+        self.conn.commit()
+        logger.info(f"Inserted {inserted} raw odds snapshots")
+        return inserted
+
+    def save_match_result(self, result: Dict):
+        """Guarda resultado final del partido (stub para integración real)."""
+        self.connect()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO raw_match_results (
+                    match_id,sport,league,home_team,away_team,match_date,
+                    result_label,home_score,away_score
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+            ''', (
+                result.get('match_id'), result.get('sport'), result.get('league'), result.get('home_team'),
+                result.get('away_team'), result.get('match_date'), result.get('result_label'),
+                result.get('home_score'), result.get('away_score')
+            ))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error guardando resultado: {e}")
+
+    def build_canonical_odds_for_match(self, match_id: str):
+        """Construye odds canónicas tomando el último snapshot previo al inicio y removiendo margen.
+
+        Si ya existen odds canónicas para el match se omite.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        # Verificar existencia
+        cursor.execute('SELECT 1 FROM canonical_odds WHERE match_id=?', (match_id,))
+        if cursor.fetchone():
+            return False
+        # Obtener snapshots ordenados por tiempo descendente
+        cursor.execute('''
+            SELECT * FROM raw_odds_snapshots WHERE match_id=? ORDER BY snapshot_time DESC
+        ''', (match_id,))
+        row = cursor.fetchone()
+        if not row:
+            return False
+        # Calcular implied probabilities y margen
+        home_odds = row['home_win_odds']
+        away_odds = row['away_win_odds']
+        draw_odds = row['draw_odds']
+        implied_home = 1/home_odds if home_odds else 0
+        implied_away = 1/away_odds if away_odds else 0
+        implied_draw = 1/draw_odds if draw_odds else 0
+        margin = implied_home + implied_away + implied_draw
+        if margin == 0:
+            logger.warning(f"Margen cero para {match_id}, odds inválidas")
+            return False
+        # Normalizar (remover margen)
+        implied_home_n = implied_home / margin
+        implied_away_n = implied_away / margin
+        implied_draw_n = implied_draw / margin if draw_odds else None
+        cursor.execute('''
+            INSERT INTO canonical_odds (
+                match_id,sport,league,home_team,away_team,match_date,snapshot_time,
+                home_win_odds,away_win_odds,draw_odds,implied_home,implied_away,implied_draw,margin
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ''', (
+            row['match_id'], row['sport'], row['league'], row['home_team'], row['away_team'], row['match_date'],
+            row['snapshot_time'], home_odds, away_odds, draw_odds,
+            implied_home_n, implied_away_n, implied_draw_n, margin
+        ))
+        self.conn.commit()
+        return True
+
+    def build_canonical_odds_bulk(self):
+        """Construye odds canónicas para todos los partidos que aún no las tengan."""
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute('''SELECT DISTINCT match_id FROM raw_odds_snapshots''')
+        match_ids = [r['match_id'] for r in cursor.fetchall()]
+        built = 0
+        for mid in match_ids:
+            if self.build_canonical_odds_for_match(mid):
+                built += 1
+        logger.info(f"Canonical odds built for {built} matches")
+        return built
+
+    def build_basic_features(self):
+        """Ingeniería de características simple basada en últimos 5 partidos y días de descanso.
+        Para MVP: usa resultados y canonical_odds ya almacenados.
+        """
+        self.connect()
+        cursor = self.conn.cursor()
+        # Obtener lista de partidos ordenados por fecha
+        cursor.execute('''SELECT match_id, sport, league, home_team, away_team, match_date FROM canonical_odds ORDER BY match_date ASC''')
+        rows = [dict(r) for r in cursor.fetchall()]
+        inserted = 0
+        for r in rows:
+            mid = r['match_id']
+            # Skip si ya existe
+            cursor.execute('SELECT 1 FROM engineered_features WHERE match_id=?', (mid,))
+            if cursor.fetchone():
+                continue
+            # Últimos 5 partidos home
+            cursor.execute('''SELECT result_label FROM raw_match_results WHERE home_team=? OR away_team=? ORDER BY match_date DESC LIMIT 5''', (r['home_team'], r['home_team']))
+            recent_home = [x['result_label'] for x in cursor.fetchall()]
+            cursor.execute('''SELECT result_label FROM raw_match_results WHERE home_team=? OR away_team=? ORDER BY match_date DESC LIMIT 5''', (r['away_team'], r['away_team']))
+            recent_away = [x['result_label'] for x in cursor.fetchall()]
+            def win_pct(team_results, team_name):
+                if not team_results:
+                    return 0.0
+                wins = 0
+                for lab in team_results:
+                    if lab == 'home_win' and team_name == 'home':
+                        wins += 1
+                    if lab == 'away_win' and team_name == 'away':
+                        wins += 1
+                return wins/len(team_results)
+            win_pct_home = win_pct(recent_home, 'home')
+            win_pct_away = win_pct(recent_away, 'away')
+            # Rest days (stub: diferencia fija)
+            rest_home = 3.0  # Placeholder
+            rest_away = 3.0
+            # Average odds last5
+            cursor.execute('''SELECT home_win_odds FROM canonical_odds WHERE home_team=? ORDER BY match_date DESC LIMIT 5''', (r['home_team'],))
+            avg_home_odds_rows = [x['home_win_odds'] for x in cursor.fetchall() if x['home_win_odds']]
+            cursor.execute('''SELECT away_win_odds FROM canonical_odds WHERE away_team=? ORDER BY match_date DESC LIMIT 5''', (r['away_team'],))
+            avg_away_odds_rows = [x['away_win_odds'] for x in cursor.fetchall() if x['away_win_odds']]
+            avg_home_odds = sum(avg_home_odds_rows)/len(avg_home_odds_rows) if avg_home_odds_rows else None
+            avg_away_odds = sum(avg_away_odds_rows)/len(avg_away_odds_rows) if avg_away_odds_rows else None
+            cursor.execute('''INSERT INTO engineered_features (match_id,sport,league,home_team,away_team,match_date,win_pct_home_last5,win_pct_away_last5,rest_days_home,rest_days_away,avg_home_odds_last5,avg_away_odds_last5) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''', (
+                mid,r['sport'],r['league'],r['home_team'],r['away_team'],r['match_date'],win_pct_home,win_pct_away,rest_home,rest_away,avg_home_odds,avg_away_odds
+            ))
+            inserted += 1
+        self.conn.commit()
+        logger.info(f"Inserted engineered features for {inserted} matches")
+        return inserted
+
+    def build_training_dataset(self, min_rows: int = 50):
+        """Construye dataset de entrenamiento juntando canonical_odds + resultados + features.
+        Retorna DataFrame listo o None si insuficiente.
+        """
+        import pandas as pd
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT c.match_id, c.sport, c.league, c.home_team, c.away_team, c.match_date,
+                   c.home_win_odds, c.away_win_odds, c.draw_odds, c.implied_home, c.implied_away, c.implied_draw,
+                   f.win_pct_home_last5, f.win_pct_away_last5, f.rest_days_home, f.rest_days_away,
+                   f.avg_home_odds_last5, f.avg_away_odds_last5, r.result_label
+            FROM canonical_odds c
+            JOIN engineered_features f ON c.match_id=f.match_id
+            JOIN raw_match_results r ON c.match_id=r.match_id
+        ''')
+        rows = cursor.fetchall()
+        if not rows or len(rows) < min_rows:
+            logger.warning("Dataset real insuficiente, usar fallback sintético.")
+            return None
+        df = pd.DataFrame([dict(r) for r in rows])
+        # Limpiar NAs simples
+        df = df.fillna(0)
+        # Mapear resultado a columna 'result'
+        df = df.rename(columns={'result_label': 'result'})
+        logger.info(f"Training dataset real construido con {len(df)} filas")
+        return df
 
 
 if __name__ == "__main__":

@@ -3,7 +3,9 @@ Notifications - Envía notificaciones vía Telegram
 """
 
 import os
+import requests
 from typing import Dict, List
+from datetime import datetime
 from loguru import logger
 
 
@@ -38,13 +40,22 @@ class TelegramNotifier:
             return False
 
         try:
-            # En producción, usar python-telegram-bot
-            # from telegram import Bot
-            # bot = Bot(token=self.bot_token)
-            # bot.send_message(chat_id=self.chat_id, text=message, parse_mode='Markdown')
-
-            logger.info(f"[TELEGRAM] Would send: {message[:100]}...")
-            return True
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            data = {
+                'chat_id': self.chat_id,
+                'text': message,
+                'parse_mode': 'Markdown',
+                'disable_web_page_preview': True
+            }
+            
+            response = requests.post(url, data=data, timeout=10)
+            
+            if response.status_code == 200:
+                logger.info(f"[TELEGRAM] Message sent successfully")
+                return True
+            else:
+                logger.error(f"[TELEGRAM] Failed to send: {response.status_code} - {response.text}")
+                return False
 
         except Exception as e:
             logger.error(f"Error sending Telegram message: {e}")
