@@ -27,8 +27,18 @@ class CLVTracker:
     def connect(self):
         """Conecta a la base de datos"""
         if self.conn is None:
-            self.conn = sqlite3.connect(self.db_path)
+            self.conn = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES
+            )
             self.conn.row_factory = sqlite3.Row
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL;")
+                self.conn.execute("PRAGMA synchronous=NORMAL;")
+                self.conn.execute("PRAGMA foreign_keys=ON;")
+            except Exception:
+                pass
 
     def close(self):
         """Cierra conexión"""

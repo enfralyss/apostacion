@@ -26,8 +26,20 @@ class BettingDatabase:
     def connect(self):
         """Establece conexión con la base de datos"""
         if self.conn is None:
-            self.conn = sqlite3.connect(self.db_path)
+            # Permitir uso seguro desde múltiples hilos (jobs/cron/streamlit callbacks)
+            # Nota: SQLite no es full concurrent; por eso activamos WAL y usamos commits cortos.
+            self.conn = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES
+            )
             self.conn.row_factory = sqlite3.Row
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL;")
+                self.conn.execute("PRAGMA synchronous=NORMAL;")
+                self.conn.execute("PRAGMA foreign_keys=ON;")
+            except Exception:
+                pass
 
     def close(self):
         """Cierra conexión con la base de datos"""

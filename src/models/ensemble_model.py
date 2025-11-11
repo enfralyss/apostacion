@@ -223,13 +223,13 @@ class EnsembleBettingModel:
         
         # Calibración (opcional pero RECOMENDADO para betting)
         if calibrate:
-            logger.info("Aplicando calibración isotónica...")
-            
-            # Calibrar el ensemble completo
+            logger.info("Aplicando calibración isotónica con más folds...")
+
+            # Calibrar el ensemble completo con más folds para mejor calibración
             self.ensemble_model = CalibratedClassifierCV(
                 self.ensemble_model,
                 method='isotonic',
-                cv=3,  # Usar 3-fold CV para calibración
+                cv=5,  # Usar 5-fold CV para mejor calibración (antes era 3)
                 n_jobs=-1
             )
             self.ensemble_model.fit(X, y_encoded)

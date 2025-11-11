@@ -225,14 +225,19 @@ class BettingScheduler:
             logger.info("🎯 [CRON] Generating daily picks...")
             
             # Ejecutar análisis
+            # Ejecutar bot en subproceso separado para aislar stdout/stderr
             result = subprocess.run(
                 [sys.executable, "bot_real.py"],
                 capture_output=True,
-                text=True
+                text=True,
+                encoding="utf-8",
+                errors="replace"
             )
-            
+
             if result.returncode != 0:
-                logger.error(f"Bot execution failed: {result.stderr}")
+                logger.error(f"Bot execution failed (code {result.returncode})")
+                logger.error(result.stderr[:500])
+                self.notifier.send_message(f"❌ Error generando picks (subprocess): {result.stderr[:200]}")
                 return
             
             # Obtener picks recientes de la DB
@@ -244,6 +249,11 @@ class BettingScheduler:
             
             bet = recent_bets[0]
             picks = self.db.get_bet_picks(bet['id'])
+
+            if not picks:
+                logger.warning("Bot ran but no picks stored in DB")
+                self.notifier.send_message("⚠️ Bot ejecutado pero no se guardaron picks (ver logs)")
+                return
             
             # Formatear mensaje para Telegram
             message = f"🎯 *PICKS DE HOY*\n\n"

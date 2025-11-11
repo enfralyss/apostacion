@@ -52,19 +52,31 @@ class OddsAPIFetcher:
 
             if not self.api_key:
                 # Fallback a variable antigua
-                self.api_key = os.getenv('ODDS_API_KEY')
-                logger.warning("No ODDS_API_KEYS pool found, using single ODDS_API_KEY")
+                legacy_val = os.getenv('ODDS_API_KEY')
+                if legacy_val and ',' in legacy_val:
+                    # El usuario puso varias keys en ODDS_API_KEY separado por comas. Construir pool dinámicamente.
+                    os.environ['ODDS_API_KEYS'] = legacy_val
+                    self.key_manager = APIKeyManager("ODDS_API_KEYS")
+                    self.api_key = self.key_manager.get_current_key()
+                    logger.info("Detected multiple keys in ODDS_API_KEY, converted to pool ODDS_API_KEYS")
+                else:
+                    self.api_key = legacy_val
+                    if self.api_key:
+                        logger.warning("No ODDS_API_KEYS pool found, using single ODDS_API_KEY")
+                    else:
+                        logger.warning("No API keys provided. Set ODDS_API_KEYS=key1,key2 or ODDS_API_KEY=single_key in .env")
 
         if not self.api_key:
             logger.warning("No API key found. Get free keys at https://the-odds-api.com/")
             logger.warning("Add to .env as: ODDS_API_KEYS=key1,key2,key3")
 
-    def get_available_matches(self, sport: str = "all") -> List[Dict]:
+    def get_available_matches(self, sport: str = "all", max_future_days: int = 7) -> List[Dict]:
         """
         Obtiene partidos con odds reales
 
         Args:
             sport: 'soccer', 'basketball', o 'all'
+            max_future_days: filtra partidos que comienzan más allá de este horizonte (default 7 días)
 
         Returns:
             Lista de partidos con odds
@@ -95,7 +107,29 @@ class OddsAPIFetcher:
         except Exception as e:
             logger.error(f"Error fetching odds: {e}")
 
-        logger.info(f"Fetched {len(matches)} matches with real odds")
+        # Filtrar partidos demasiado lejanos si se especifica horizonte
+        if max_future_days is not None:
+            now = datetime.utcnow()
+            filtered = []
+            for m in matches:
+                raw_dt = m.get('match_date')
+                try:
+                    # Normalizar formato ISO (remplazar Z por +00:00 para fromisoformat)
+                    if isinstance(raw_dt, str):
+                        iso_dt = raw_dt.replace('Z', '+00:00')
+                        dt_obj = datetime.fromisoformat(iso_dt)
+                    else:
+                        dt_obj = raw_dt
+                    delta_days = (dt_obj - now).days
+                    if delta_days <= max_future_days:
+                        filtered.append(m)
+                except Exception:
+                    # Si no se puede parsear fecha, mantener partido (conservador)
+                    filtered.append(m)
+            logger.info(f"Date filter applied (<= {max_future_days} days): {len(filtered)} / {len(matches)} matches kept")
+            matches = filtered
+
+        logger.info(f"Fetched {len(matches)} matches with real odds (post-filter)")
         return matches
 
     def _fetch_sport_odds(self, sport_key: str, league_name: str) -> List[Dict]:
@@ -233,7 +267,14 @@ class OddsAPIFetcher:
         """Verifica el estado de la API y requests restantes (soporta pool)"""
 
         if not self.api_key:
-            return {'status': 'error', 'message': 'No API key'}
+            return {
+                'status': 'error',
+                'message': 'No API key configured. Set ODDS_API_KEYS or ODDS_API_KEY in your environment/.env',
+                'setup': {
+                    'env_vars': ['ODDS_API_KEYS', 'ODDS_API_KEY'],
+                    'docs': 'https://the-odds-api.com/'
+                }
+            }
 
         try:
             # Hacer un request simple para ver headers
@@ -255,6 +296,9 @@ class OddsAPIFetcher:
                 'requests_used': used,
                 'status_code': response.status_code
             }
+
+            if response.status_code == 401:
+                status_info['message'] = 'Invalid or missing The Odds API key (401). Configure ODDS_API_KEYS or ODDS_API_KEY.'
 
             # Si hay pool, agregar status del pool
             if self.key_manager:

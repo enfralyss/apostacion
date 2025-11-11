@@ -6,10 +6,10 @@
   "n_folds": 3,
   "n_samples": 3490,
   "n_features": 24,
-  "ece_after_calibration": 0.27729703028646163,
+  "ece_after_calibration": 0.2886095817721606,
   "calibrated": true,
   "sport": "soccer",
-  "trained_at": "2025-11-10T20:51:58.499777",
+  "trained_at": "2025-11-10T21:07:07.891437",
   "model_type": "ensemble",
   "base_models": [
     "xgboost",

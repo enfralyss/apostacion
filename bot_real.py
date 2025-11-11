@@ -69,7 +69,14 @@ class RealBettingBot:
 
         if status['status'] != 'ok':
             print(f"Error con API: {status}")
-            return {'success': False, 'error': 'API not available'}
+            # Guía rápida para configurar keys
+            print("\nPara usar datos reales de cuotas necesitas configurar The Odds API key(s):")
+            print("1) Crea un archivo .env en la raíz del repo (o usa variables de entorno)")
+            print("2) Agrega una de estas opciones:")
+            print("   - ODDS_API_KEYS=key1,key2 (recomendado, pool de keys)")
+            print("   - ODDS_API_KEY=tu_key_unica (modo legacy)")
+            print("3) Regístrate gratis en https://the-odds-api.com/ para obtener una key (500 requests/mes)")
+            return {'success': False, 'error': 'API not available (configure ODDS_API_KEYS / ODDS_API_KEY)'}
 
         print(f"API OK - Requests restantes: {status.get('requests_remaining', 'unknown')}")
 
@@ -94,7 +101,8 @@ class RealBettingBot:
         # Mostrar algunos ejemplos
         print("\nEjemplos de partidos:")
         for match in matches[:5]:
-            print(f"   • {match['league']}: {match['home_team']} vs {match['away_team']}")
+            # Evitar caracteres unicode que causan errores en consolas Windows (charmap)
+            print(f"   - {match['league']}: {match['home_team']} vs {match['away_team']}")
             print(f"     Odds: 1:{match['odds']['home_win']:.2f} X:{match['odds'].get('draw', 'N/A')} 2:{match['odds']['away_win']:.2f}")
 
         # 3. Analizar con ML
@@ -103,7 +111,8 @@ class RealBettingBot:
         print(f"OK - {len(predictions)} predicciones generadas")
 
         if len(predictions) == 0:
-            print("\n⚠️  WARNING: No se generaron predicciones del modelo ML")
+            # Evitar emoji que rompe en consolas con encoding limitado
+            print("\nWARNING: No se generaron predicciones del modelo ML")
             print("Posibles causas:")
             print("  1. Modelo no cargado correctamente")
             print("  2. Error en features del modelo")

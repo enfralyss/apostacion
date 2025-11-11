@@ -463,7 +463,63 @@ with tab_hist:
     st.subheader("🗂️ Histórico de apuestas")
     bets = db.get_recent_bets(50)
     if bets:
-        st.dataframe(pd.DataFrame(bets))
+        # Enriquecer con ventana de fechas de partidos y renombrar columnas para mayor claridad
+        enriched_rows = []
+        for b in bets:
+            picks = db.get_bet_picks(b['id'])
+            # Extraer fechas de los partidos (si existen en picks)
+            dates = sorted({p.get('match_date') for p in picks if p.get('match_date')})
+            if dates:
+                match_window = dates[0] if len(dates) == 1 else f"{dates[0]} → {dates[-1]} ({len(dates)} partidos)"
+            else:
+                match_window = None
+            # Añadir número real de picks (por si num_picks está desfasado)
+            b_copy = dict(b)
+            b_copy['match_window'] = match_window
+            b_copy['real_num_picks'] = len(picks)
+            enriched_rows.append(b_copy)
+        df_hist_bets = pd.DataFrame(enriched_rows)
+        # Mapeo de nombres amigables
+        col_map = {
+            'id': 'Bet ID',
+            'bet_date': 'Fecha apuesta',
+            'sport': 'Deporte',
+            'bet_type': 'Tipo',
+            'num_picks': 'Picks (decl.)',
+            'real_num_picks': 'Picks reales',
+            'match_window': 'Fecha(s) partidos',
+            'total_odds': 'Cuota Total',
+            'stake': 'Stake',
+            'potential_return': 'Retorno Potencial',
+            'status': 'Estado',
+            'result': 'Resultado',
+            'profit_loss': 'P/L',
+            'bankroll_before': 'Bankroll Antes',
+            'bankroll_after': 'Bankroll Después',
+            'opening_odds': 'Odds Apertura',
+            'closing_odds': 'Odds Cierre',
+            'clv_percentage': 'CLV %',
+            'placed_odds': 'Odds Colocadas',
+            'adjusted_stake': 'Stake Ajustado',
+            'edge_at_recommendation': 'Edge (Recomendación)',
+            'edge_at_placement': 'Edge (Colocación)',
+            'created_at': 'Creada',
+            'settled_at': 'Cerrada',
+            'notes': 'Notas'
+        }
+        # Reordenar columnas principales para lectura
+        preferred_order = [
+            'Bet ID','Fecha apuesta','Fecha(s) partidos','Tipo','Deporte','Picks reales','Picks (decl.)',
+            'Cuota Total','Stake','Retorno Potencial','Odds Apertura','Odds Colocadas','Odds Cierre','CLV %',
+            'Edge (Recomendación)','Edge (Colocación)','Estado','Resultado','P/L','Bankroll Antes','Bankroll Después',
+            'Creada','Cerrada','Notas'
+        ]
+        df_display = df_hist_bets.rename(columns=col_map)
+        # Añadir columnas faltantes sin romper
+        existing_order = [c for c in preferred_order if c in df_display.columns]
+        other_cols = [c for c in df_display.columns if c not in existing_order]
+        df_display = df_display[existing_order + other_cols]
+        st.dataframe(df_display, use_container_width=True)
         st.markdown("### 🔔 Resolver Picks Pendientes")
         if st.button("Resolver y Notificar Picks", key="btn_resolve_picks"):
             resolved = db.resolve_pending_picks()
