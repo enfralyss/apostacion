@@ -5,6 +5,10 @@ Stake Calculator - Calcula el tamaño óptimo de apuesta usando Kelly Criterion 
 from typing import Dict
 from loguru import logger
 import yaml
+try:
+    from src.utils.database import BettingDatabase
+except Exception:
+    BettingDatabase = None
 
 
 class StakeCalculator:
@@ -21,6 +25,18 @@ class StakeCalculator:
                 'kelly_fraction': 0.25,
                 'max_bet_percentage': 5.0
             }
+        # Intentar overrides desde DB
+        try:
+            if BettingDatabase is not None:
+                db = BettingDatabase()
+                kf = db.get_parameter('kelly_fraction', None)
+                mbp = db.get_parameter('max_bet_percentage', None)
+                if kf is not None:
+                    self.bankroll_config['kelly_fraction'] = float(kf)
+                if mbp is not None:
+                    self.bankroll_config['max_bet_percentage'] = float(mbp)
+        except Exception as e:
+            logger.debug(f"DB bankroll overrides not available: {e}")
 
     def kelly_criterion(self, probability: float, odds: float) -> float:
         """
@@ -93,35 +109,36 @@ class StakeCalculator:
         if full_kelly <= 0:
             return 0
 
-        # Aplicar 1/4 Kelly (fractional Kelly conservador)
-        # Reduce varianza ~75% vs Full Kelly, solo -25% expected return
-        # Es el sweet spot entre crecimiento y seguridad
-        fractional_kelly = full_kelly * 0.25  # 1/4 Kelly
-        
+        # Aplicar Kelly fraccional configurable (default 1/4)
+        kelly_frac_cfg = float(self.bankroll_config.get('kelly_fraction', 0.25))
+        fractional_kelly = full_kelly * kelly_frac_cfg
+
         # Calcular stake base
         stake = bankroll * fractional_kelly
 
         # CAPS DE SEGURIDAD:
-        
-        # 1. Cap máximo: 5% del bankroll (protección contra Kelly alto en outliers)
-        max_stake = bankroll * 0.05
+        # 1. Cap máximo configurable del bankroll
+        max_cap_pct = float(self.bankroll_config.get('max_bet_percentage', 5.0)) / 100.0
+        max_stake = bankroll * max_cap_pct
         stake = min(stake, max_stake)
-        
+
         # 2. Cap mínimo: 0.5% del bankroll (evitar apuestas demasiado pequeñas)
         min_stake = bankroll * 0.005
         if stake < min_stake and edge > 0.05:  # Solo si edge es bueno
             stake = min_stake
-        
+
         # 3. Cap absoluto mínimo: 1 unidad monetaria
         stake = max(stake, 1.0)
 
         # Redondear a 2 decimales
         stake = round(stake, 2)
 
-        logger.info(f"🎯 Kelly Stake: prob={probability:.1%}, odds={odds:.2f}, "
-                    f"edge={edge:.1%}, full_kelly={full_kelly:.1%}, "
-                    f"1/4_kelly={fractional_kelly:.1%}, stake=${stake:.2f} "
-                    f"({stake/bankroll*100:.1f}% of bankroll)")
+        logger.info(
+            f"🎯 Kelly Stake: prob={probability:.1%}, odds={odds:.2f}, "
+            f"edge={edge:.1%}, full_kelly={full_kelly:.1%}, "
+            f"frac_kelly={fractional_kelly:.1%}, stake=${stake:.2f} "
+            f"({stake/bankroll*100:.1f}% of bankroll)"
+        )
 
         return stake
 

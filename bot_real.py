@@ -204,6 +204,30 @@ class RealBettingBot:
             'bet_id': bet_id
         }
 
+    def resolve_and_notify_pick_results(self):
+        """Resuelve picks pendientes desde resultados recientes y envía notificaciones por pick."""
+        try:
+            resolved = self.db.resolve_pending_picks()
+            if not resolved:
+                return 0
+            sent = 0
+            for info in resolved:
+                try:
+                    c = self.db.conn.cursor()
+                    c.execute('SELECT league, home_team, away_team, prediction, odds, predicted_probability, edge FROM picks WHERE id=?', (info['pick_id'],))
+                    prow = c.fetchone()
+                    pick_detail = dict(prow) if prow else {}
+                    pick_detail.update(info)
+                    if self.notifier.enabled:
+                        if self.notifier.send_pick_result(pick_detail):
+                            sent += 1
+                except Exception:
+                    pass
+            return sent
+        except Exception as e:
+            logger.error(f"Error resolving pick results: {e}")
+            return 0
+
     def _display_recommendation(self, parlay, stake, potential_return, potential_profit):
         """Muestra la recomendación final"""
 
@@ -269,6 +293,14 @@ def main():
 
     try:
         result = bot.run_analysis()
+
+        # Intentar resolver picks pendientes y notificar (si hubo resultados recién cargados)
+        try:
+            sent = bot.resolve_and_notify_pick_results()
+            if sent:
+                print(f"Notificaciones de picks enviadas: {sent}")
+        except Exception:
+            pass
 
         if result['success']:
             if result.get('picks_found', 0) > 0:

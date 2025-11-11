@@ -219,6 +219,45 @@ class TelegramNotifier:
 
         return self.send_message(message)
 
+    def send_pick_result(self, pick: Dict) -> bool:
+        """Envía notificación cuando un pick individual se resuelve.
+
+        Espera un dict con:
+          - league, home_team, away_team, prediction, odds, predicted_probability, edge
+          - pick_result: 'won' | 'lost'
+          - bet_id, bet_settled, bet_result (opcionales)
+        """
+        if not pick:
+            return False
+        outcome = pick.get('pick_result') or pick.get('result')
+        emoji = '✅' if outcome == 'won' else ('❌' if outcome == 'lost' else 'ℹ️')
+        msg = f"{emoji} *PICK RESULT*\n\n"
+        league = pick.get('league', '')
+        if league:
+            msg += f"🏟️ {league}\n"
+        ht = pick.get('home_team', 'Local')
+        at = pick.get('away_team', 'Visitante')
+        msg += f"{ht} vs {at}\n"
+        pred = pick.get('prediction', '')
+        if pred:
+            msg += f"Pick: *{pred}*\n"
+        odds = pick.get('odds')
+        if odds:
+            msg += f"Cuota: {float(odds):.2f}\n"
+        prob = pick.get('predicted_probability')
+        if prob is not None:
+            msg += f"Confianza: {float(prob):.1%}\n"
+        edge = pick.get('edge')
+        if edge is not None:
+            msg += f"Edge: {float(edge)*100:.1f}%\n"
+        # Contexto de parlay
+        if pick.get('bet_id'):
+            if pick.get('bet_settled'):
+                msg += f"\nParlay ID {pick['bet_id']} -> *{pick.get('bet_result','')}*\n"
+            else:
+                msg += f"\nParlay ID {pick['bet_id']} sigue en juego\n"
+        return self.send_message(msg)
+
     def send_alert(self, alert_type: str, message: str) -> bool:
         """
         Envía alerta importante

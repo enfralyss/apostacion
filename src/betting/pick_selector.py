@@ -5,6 +5,10 @@ Pick Selector - Selecciona picks con valor basándose en predicciones y criterio
 from typing import List, Dict
 from loguru import logger
 import yaml
+try:
+    from src.utils.database import BettingDatabase
+except Exception:
+    BettingDatabase = None
 
 
 class PickSelector:
@@ -19,6 +23,16 @@ class PickSelector:
             self.config = yaml.safe_load(f)
 
         self.pick_criteria = self.config['picks']
+        # Overrides desde DB si existen
+        try:
+            if BettingDatabase is not None:
+                db = BettingDatabase()
+                for key in ['min_probability', 'min_edge', 'min_odds', 'max_odds', 'max_picks_per_league']:
+                    val = db.get_parameter(key, None)
+                    if val is not None:
+                        self.pick_criteria[key] = float(val) if key != 'max_picks_per_league' else int(val)
+        except Exception:
+            pass
 
     def calculate_implied_probability(self, odds: float) -> float:
         """
@@ -249,8 +263,7 @@ class PickSelector:
 
 
 if __name__ == "__main__":
-    # Test del selector
-    from src.scrapers.triunfobet_scraper import TriunfoBetScraper
+    # Test del selector (scraper opcional no incluido en este entorno)
     from src.models.predictor import MatchPredictor
     import os
 
@@ -263,11 +276,9 @@ if __name__ == "__main__":
         train_all_models()
 
     # Obtener partidos y predicciones
-    scraper = TriunfoBetScraper(use_mock=True)
     predictor = MatchPredictor()
     selector = PickSelector()
-
-    matches = scraper.get_available_matches("all")
+    matches = []  # Placeholder: agregar partidos mock si se requiere
     predictions = predictor.predict_multiple_matches(matches)
 
     # Seleccionar picks

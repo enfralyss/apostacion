@@ -111,6 +111,19 @@ class BettingScheduler:
                     f"✅ {saved} partidos finalizados registrados\n"
                     f"📊 Dataset listo para actualizar"
                 )
+                # Resolver picks pendientes y notificar
+                resolved = self.db.resolve_pending_picks()
+                for info in resolved:
+                    # Enriquecer con datos del pick para el mensaje
+                    try:
+                        c = self.db.conn.cursor()
+                        c.execute('SELECT league, home_team, away_team, prediction, odds, predicted_probability, edge FROM picks WHERE id=?', (info['pick_id'],))
+                        prow = c.fetchone()
+                        pick_detail = dict(prow) if prow else {}
+                        pick_detail.update(info)
+                        self.notifier.send_pick_result(pick_detail)
+                    except Exception:
+                        pass
             
         except Exception as e:
             logger.error(f"Error in results update job: {e}")

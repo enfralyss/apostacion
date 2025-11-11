@@ -39,6 +39,28 @@ class BettingDatabase:
         """Crea las tablas necesarias si no existen"""
         self.connect()
         cursor = self.conn.cursor()
+        # Tabla de parámetros clave-valor
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS parameters (
+                param_name TEXT PRIMARY KEY,
+                param_value TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # Historial de cambios de parámetros
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS parameter_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                old_value TEXT,
+                new_value TEXT,
+                changed_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
         # Tabla de apuestas
         cursor.execute('''
@@ -99,6 +121,8 @@ class BettingDatabase:
                 predicted_probability REAL,
                 edge REAL,
                 result TEXT,
+                settled_at TEXT,
+                result_source TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (bet_id) REFERENCES bets (id)
             )
@@ -220,6 +244,65 @@ class BettingDatabase:
         self.conn.commit()
         logger.info("Database tables created/verified")
 
+    # --- Parámetros clave-valor ---
+    def _parse_param_value(self, value: str):
+        try:
+            if value.lower() in ("true", "false"):
+                return value.lower() == "true"
+            if value.isdigit():
+                return int(value)
+            if any(ch.isdigit() for ch in value) and value.count('.') == 1:
+                return float(value)
+            return value
+        except Exception:
+            return value
+
+    def get_parameter(self, name: str, default=None):
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT param_value FROM parameters WHERE param_name=?', (name,))
+        row = cursor.fetchone()
+        if row:
+            return self._parse_param_value(row['param_value'])
+        return default
+
+    def set_parameter(self, name: str, value):
+        """Inserta o actualiza un parámetro y registra el cambio en el historial si difiere del anterior."""
+        self.connect()
+        cursor = self.conn.cursor()
+        value_str = str(value)
+        # Obtener valor previo
+        cursor.execute('SELECT param_value FROM parameters WHERE param_name=?', (name,))
+        prev = cursor.fetchone()
+        old_value = prev['param_value'] if prev else None
+        cursor.execute(
+            '''INSERT INTO parameters (param_name, param_value, updated_at)
+               VALUES (?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(param_name) DO UPDATE SET param_value=excluded.param_value, updated_at=CURRENT_TIMESTAMP''',
+            (name, value_str)
+        )
+        # Registrar historial si cambió
+        if old_value is not None and old_value != value_str:
+            cursor.execute('INSERT INTO parameter_history (name, old_value, new_value) VALUES (?,?,?)', (name, old_value, value_str))
+        self.conn.commit()
+        logger.info(f"Parameter '{name}' set to {value_str} (old={old_value})")
+
+    def get_all_parameters(self):
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT param_name, param_value, updated_at FROM parameters')
+        rows = cursor.fetchall()
+        out = []
+        for r in rows:
+            out.append({'name': r['param_name'], 'value': self._parse_param_value(r['param_value']), 'updated_at': r['updated_at']})
+        return out
+
+    def get_parameter_history(self, limit: int = 50):
+        self.connect()
+        cursor = self.conn.cursor()
+        cursor.execute('''SELECT name, old_value, new_value, changed_at FROM parameter_history ORDER BY changed_at DESC LIMIT ?''', (limit,))
+        return [dict(r) for r in cursor.fetchall()]
+
     def save_bet(self, bet_data: Dict, picks: List[Dict]) -> int:
         """
         Guarda una apuesta en la base de datos
@@ -308,6 +391,98 @@ class BettingDatabase:
 
         self.conn.commit()
         logger.info(f"Bet {bet_id} updated: {result}, P/L: ${profit_loss:.2f}")
+
+    def update_pick_result(self, pick_id: int, final_result: str, source: str = 'raw_match_results') -> Optional[Dict]:
+        """Actualiza el resultado de un pick individual y si todos los picks del bet están resueltos, liquida la apuesta.
+
+        Args:
+            pick_id: ID del pick
+            final_result: 'won' | 'lost'
+            source: origen del resultado (para auditoría)
+
+        Returns:
+            Dict con info del pick y estado del bet tras actualización o None si error
+        """
+        try:
+            self.connect()
+            c = self.conn.cursor()
+            # Recuperar pick y bet asociado
+            c.execute('SELECT id, bet_id, prediction, odds, edge FROM picks WHERE id=?', (pick_id,))
+            prow = c.fetchone()
+            if not prow:
+                logger.warning(f"Pick {pick_id} no encontrado")
+                return None
+            bet_id = prow['bet_id']
+            # Marcar pick
+            c.execute('''UPDATE picks SET result=?, settled_at=?, result_source=? WHERE id=?''', (
+                final_result, datetime.now().isoformat(), source, pick_id
+            ))
+            # Verificar si todos los picks están resueltos
+            c.execute('SELECT result FROM picks WHERE bet_id=?', (bet_id,))
+            all_results = [r['result'] for r in c.fetchall()]
+            pending_left = any(r is None or r == '' for r in all_results)
+            bet_settled = False
+            bet_result = None
+            profit_loss = 0.0
+            bankroll_after = None
+            if not pending_left:
+                # Calcular resultado del parlay: gana si todos ganaron
+                all_won = all(r == 'won' for r in all_results)
+                bet_result = 'won' if all_won else 'lost'
+                # Obtener stake y total_odds
+                c.execute('SELECT stake, total_odds, bankroll_before FROM bets WHERE id=?', (bet_id,))
+                brow = c.fetchone()
+                if brow:
+                    stake = brow['stake'] or 0
+                    total_odds = brow['total_odds'] or 0
+                    bankroll_before = brow['bankroll_before'] or 0
+                    if bet_result == 'won':
+                        profit_loss = stake * (total_odds - 1)
+                    else:
+                        profit_loss = -stake
+                    bankroll_after = bankroll_before + profit_loss
+                    self.update_bet_result(bet_id, bet_result, profit_loss, bankroll_after)
+                    bet_settled = True
+            self.conn.commit()
+            info = {
+                'pick_id': pick_id,
+                'bet_id': bet_id,
+                'pick_result': final_result,
+                'bet_settled': bet_settled,
+                'bet_result': bet_result,
+                'profit_loss': profit_loss,
+                'bankroll_after': bankroll_after
+            }
+            return info
+        except Exception as e:
+            logger.error(f"Error actualizando pick {pick_id}: {e}")
+            return None
+
+    def resolve_pending_picks(self) -> List[Dict]:
+        """Resuelve picks pendientes comparando su match_id con raw_match_results.
+        Retorna lista de dicts con info de picks actualizados.
+        """
+        self.connect()
+        c = self.conn.cursor()
+        # Obtener picks sin resultado
+        c.execute('SELECT id, match_id, prediction FROM picks WHERE result IS NULL OR result=""')
+        picks = c.fetchall()
+        if not picks:
+            return []
+        resolved = []
+        for p in picks:
+            match_id = p['match_id']
+            c.execute('SELECT result_label FROM raw_match_results WHERE match_id=?', (match_id,))
+            row = c.fetchone()
+            if not row:
+                continue
+            actual = row['result_label']
+            prediction = p['prediction']
+            pick_outcome = 'won' if actual == prediction else 'lost'
+            info = self.update_pick_result(p['id'], pick_outcome)
+            if info:
+                resolved.append(info)
+        return resolved
 
     def update_bet_closing_odds(self, bet_id: int, closing_odds: float):
         """Actualiza closing odds y calcula CLV%"""

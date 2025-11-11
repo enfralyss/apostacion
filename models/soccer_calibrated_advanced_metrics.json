@@ -1,0 +1,8 @@
+{
+  "ece_before_calibration": 0.09227141618387064,
+  "ece_after_calibration": 0.0,
+  "ece_improvement": 0.09227141618387064,
+  "cv_accuracy_mean": 0.4904434250764526,
+  "cv_logloss_mean": 1.2913624498941039,
+  "cv_ece_mean": 0.23472603918580104
+}

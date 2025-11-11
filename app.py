@@ -16,9 +16,160 @@ st.title("TriunfoBet ML Bot - Panel")
 db = BettingDatabase()
 
 # Secciones con tabs para organización
-tab_dashboard, tab_picks, tab_backtest, tab_realdata, tab_modelos, tab_hist, tab_clv = st.tabs([
-    "Dashboard", "Picks de hoy", "Backtesting", "Datos Reales", "Modelos", "Histórico", "CLV"
+tab_dashboard, tab_picks, tab_backtest, tab_realdata, tab_modelos, tab_hist, tab_clv, tab_params = st.tabs([
+    "Dashboard", "Picks de hoy", "Backtesting", "Datos Reales", "Modelos", "Histórico", "CLV", "Parámetros"
  ])
+import json
+import datetime
+from autotune import autotune_parameters
+with tab_params:
+    st.subheader("⚙️ Gestión de Parámetros y Autotuning")
+    st.caption("Edita parámetros clave, lanza autotuning y restaura valores previos.")
+    # Mostrar parámetros actuales
+    params = db.get_all_parameters()
+    if params:
+        df_params = pd.DataFrame(params)
+        # Mostrar columnas disponibles en la tabla actual
+        cols = [c for c in ['name', 'value', 'updated_at'] if c in df_params.columns]
+        st.dataframe(df_params[cols], use_container_width=True)
+    else:
+        st.info("No hay parámetros registrados en la base de datos.")
+        # Opción para inicializar parámetros básicos desde config.yaml
+        if st.button("Inicializar parámetros desde config.yaml", key="btn_seed_params"):
+            try:
+                import yaml as _yaml
+                with open("config/config.yaml", "r", encoding="utf-8") as f:
+                    cfg = _yaml.safe_load(f)
+                picks_cfg = (cfg or {}).get('picks', {})
+                for key in ['min_edge', 'min_probability', 'min_odds', 'max_odds']:
+                    if key in picks_cfg:
+                        db.set_parameter(key, picks_cfg[key])
+                st.success("Parámetros inicializados desde config.yaml")
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"No se pudieron inicializar parámetros: {e}")
+
+    st.markdown("### ✏️ Editar Parámetro")
+    param_names = [p['name'] for p in params] if params else []
+    with st.form("edit_param_form"):
+        param_to_edit = st.selectbox("Selecciona parámetro", param_names)
+        current_value = next((p['value'] for p in params if p['name'] == param_to_edit), "") if param_to_edit else ""
+        new_value = st.text_input("Nuevo valor", value=str(current_value))
+        submit_edit = st.form_submit_button("Actualizar parámetro")
+        if submit_edit:
+            if not param_to_edit:
+                st.warning("Selecciona un parámetro para actualizar.")
+            else:
+                db.set_parameter(param_to_edit, new_value)
+                st.success(f"Parámetro '{param_to_edit}' actualizado a {new_value}")
+                st.experimental_rerun()
+
+    # Crear nuevo parámetro
+    with st.expander("➕ Agregar nuevo parámetro"):
+        with st.form("add_param_form"):
+            new_name = st.text_input("Nombre del parámetro")
+            new_val = st.text_input("Valor")
+            submit_new = st.form_submit_button("Crear parámetro")
+            if submit_new:
+                if not new_name:
+                    st.warning("Debes indicar un nombre para el parámetro.")
+                else:
+                    db.set_parameter(new_name, new_val)
+                    st.success(f"Parámetro '{new_name}' creado.")
+                    st.experimental_rerun()
+
+    st.markdown("### 🤖 Autotuning de Parámetros")
+    st.info("Lanza una búsqueda automática de los mejores parámetros para selección de picks. Esto puede tardar varios minutos.")
+    if st.button("Ejecutar Autotuning", key="btn_autotune"):
+        with st.spinner("Ejecutando autotuning (rápido)..."):
+            # Limitar tamaño y combinaciones para evitar bloqueos largos en UI
+            result = autotune_parameters(db, sample_size=200, max_combinations=24, time_limit_sec=120)
+            if result and result.get('best_params') is not None:
+                best = result.get('best_metrics', {})
+                st.success(f"Mejores parámetros encontrados: {json.dumps(result['best_params'])}")
+                # Guardar en DB
+                for k, v in result['best_params'].items():
+                    db.set_parameter(k, v)
+                st.info("Parámetros óptimos aplicados.")
+                # Métricas
+                colm1, colm2, colm3, colm4, colm5 = st.columns(5)
+                colm1.metric("ROI", f"{best.get('roi',0):.2%}")
+                colm2.metric("Win Rate", f"{best.get('win_rate',0):.1%}")
+                colm3.metric("Geo Growth (log)", f"{best.get('geo_growth',0):.4f}")
+                colm4.metric("Volatilidad", f"{best.get('volatility',0):.2f}")
+                colm5.metric("Score", f"{best.get('score',0):.3f}")
+                # Mostrar resumen de pruebas
+                tested = result.get('tested', [])
+                st.caption(f"Combinaciones evaluadas: {len(tested)}")
+                if tested:
+                    with st.expander("Detalle de combinaciones evaluadas"):
+                        import pandas as _pd
+                        df_t = _pd.DataFrame([
+                            {
+                                **t['params'],
+                                'roi': t['metrics'].get('roi'),
+                                'win_rate': t['metrics'].get('win_rate'),
+                                'geo_growth': t['metrics'].get('geo_growth'),
+                                'volatility': t['metrics'].get('volatility'),
+                                'score': t['metrics'].get('score'),
+                                'n': t['metrics'].get('n')
+                            } for t in tested
+                        ])
+                        st.dataframe(df_t.sort_values('score', ascending=False), use_container_width=True)
+            else:
+                st.error("❌ No se encontraron parámetros óptimos.")
+                st.warning("""
+                **Posibles causas:**
+                - No hay suficientes datos históricos en la base de datos (se necesitan partidos con resultados en `raw_match_results` y odds en `canonical_odds`)
+                - Ninguna combinación de parámetros cumplió con el criterio mínimo (n > 20 picks)
+                - El tiempo de ejecución se agotó antes de encontrar buenos parámetros
+                
+                **Soluciones:**
+                - Ejecuta el bootstrap de datos históricos: `python bootstrap_historical_data.py`
+                - Aumenta el `sample_size` o `max_combinations` en el código
+                - Revisa que tengas modelos entrenados (`models/soccer_model.pkl`, `models/nba_model.pkl`)
+                """)
+                # Mostrar combinaciones evaluadas para debug
+                tested = result.get('tested', []) if result else []
+                if tested:
+                    st.info(f"Se evaluaron {len(tested)} combinaciones, pero ninguna fue lo suficientemente buena.")
+                    with st.expander("🔍 Ver combinaciones evaluadas (debug)"):
+                        import pandas as _pd
+                        df_t = _pd.DataFrame([
+                            {
+                                **t['params'],
+                                'roi': t['metrics'].get('roi'),
+                                'win_rate': t['metrics'].get('win_rate'),
+                                'n': t['metrics'].get('n'),
+                                'score': t['metrics'].get('score')
+                            } for t in tested
+                        ])
+                        st.dataframe(df_t.sort_values('score', ascending=False), use_container_width=True)
+                else:
+                    st.warning("No se pudo evaluar ninguna combinación. Verifica que tengas datos históricos.")
+
+    st.markdown("### 🕑 Historial de Cambios de Parámetros")
+    # Suponiendo que hay un método get_parameter_history()
+    try:
+        history = db.get_parameter_history(limit=50) if hasattr(db, 'get_parameter_history') else []
+    except Exception:
+        history = []
+    if history:
+        df_hist = pd.DataFrame(history)
+        df_hist['changed_at'] = pd.to_datetime(df_hist['changed_at'])
+        st.dataframe(df_hist[['name', 'old_value', 'new_value', 'changed_at']], use_container_width=True)
+        st.markdown("#### Restaurar valor previo")
+        with st.form("restore_param_form"):
+            hist_options = [f"{row['name']} @ {row['changed_at']}" for _, row in df_hist.iterrows()]
+            restore_sel = st.selectbox("Selecciona cambio a restaurar", hist_options)
+            submit_restore = st.form_submit_button("Restaurar")
+            if submit_restore and restore_sel:
+                idx = hist_options.index(restore_sel)
+                row = df_hist.iloc[idx]
+                db.set_parameter(row['name'], row['old_value'])
+                st.success(f"Parámetro '{row['name']}' restaurado a valor previo: {row['old_value']}")
+    else:
+        st.info("No hay historial de cambios de parámetros disponible.")
 
 with tab_dashboard:
     metrics = db.calculate_performance_metrics()
@@ -313,6 +464,32 @@ with tab_hist:
     bets = db.get_recent_bets(50)
     if bets:
         st.dataframe(pd.DataFrame(bets))
+        st.markdown("### 🔔 Resolver Picks Pendientes")
+        if st.button("Resolver y Notificar Picks", key="btn_resolve_picks"):
+            resolved = db.resolve_pending_picks()
+            if not resolved:
+                st.info("No hay picks pendientes con resultados disponibles.")
+            else:
+                st.success(f"{len(resolved)} picks resueltos")
+                # Enviar notificaciones individuales
+                try:
+                    from src.utils.notifications import TelegramNotifier
+                    notifier = TelegramNotifier()
+                    if notifier.enabled:
+                        sent = 0
+                        for info in resolved:
+                            cur = db.conn.cursor()
+                            cur.execute('SELECT league, home_team, away_team, prediction, odds, predicted_probability, edge FROM picks WHERE id=?', (info['pick_id'],))
+                            prow = cur.fetchone()
+                            pick_detail = dict(prow) if prow else {}
+                            pick_detail.update(info)
+                            if notifier.send_pick_result(pick_detail):
+                                sent += 1
+                        st.info(f"Notificaciones enviadas: {sent}")
+                    else:
+                        st.warning("Telegram no está configurado (faltan credenciales).")
+                except Exception as e:
+                    st.error(f"Error enviando notificaciones: {e}")
     else:
         st.info("Sin apuestas registradas.")
 

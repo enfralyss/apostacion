@@ -1,31 +1,75 @@
 """
 Predictor - Usa modelos entrenados para predecir resultados de partidos
+Actualizado para usar EnsembleModel o CalibratedBettingModel con features avanzadas
 """
 
 import pandas as pd
 from typing import Dict
 from loguru import logger
-from src.models.train_model import BettingModel
+from src.models.ensemble_model import EnsembleBettingModel
+from src.models.calibrated_model_simple import CalibratedBettingModel
+from src.models.train_model import BettingModel  # Fallback para NBA
+from src.data.feature_integration import calculate_match_features_advanced
 from src.utils.database import BettingDatabase
+import os
 
 
 class MatchPredictor:
     """Predictor de resultados de partidos"""
 
-    def __init__(self, soccer_model_path: str = "models/soccer_model.pkl",
-                 nba_model_path: str = "models/nba_model.pkl"):
+    def __init__(self,
+                 soccer_model_path: str = "models/soccer_ensemble.pkl",
+                 nba_model_path: str = "models/nba_model.pkl",
+                 use_ensemble: bool = True):
         """
         Args:
-            soccer_model_path: Ruta al modelo de fútbol
+            soccer_model_path: Ruta al modelo de fútbol (ensemble por defecto)
             nba_model_path: Ruta al modelo de NBA
+            use_ensemble: Si True, intenta cargar ensemble primero, luego calibrado
         """
-        try:
-            self.soccer_model = BettingModel.load(soccer_model_path)
-            logger.info("Soccer model loaded successfully")
-        except FileNotFoundError:
-            logger.warning(f"Soccer model not found at {soccer_model_path}")
-            self.soccer_model = None
+        # Cargar modelo de soccer con prioridad: Ensemble > Calibrado > Antiguo
+        self.soccer_model = None
+        self.model_type = None
+        self.is_calibrated = False
 
+        # 1. Intentar cargar ENSEMBLE (mejor opción)
+        if use_ensemble:
+            ensemble_path = "models/soccer_ensemble.pkl"
+            if os.path.exists(ensemble_path):
+                try:
+                    self.soccer_model = EnsembleBettingModel.load(ensemble_path)
+                    self.model_type = "ensemble"
+                    self.is_calibrated = True
+                    logger.info(f"✅ Soccer ENSEMBLE model loaded from {ensemble_path}")
+                    logger.info(f"   Models: XGBoost + LightGBM + Random Forest")
+                except Exception as e:
+                    logger.warning(f"Could not load ensemble model: {e}")
+
+        # 2. Fallback: Modelo calibrado simple
+        if self.soccer_model is None:
+            calibrated_path = "models/soccer_calibrated_advanced.pkl"
+            if os.path.exists(calibrated_path):
+                try:
+                    self.soccer_model = CalibratedBettingModel.load(calibrated_path)
+                    self.model_type = "calibrated_simple"
+                    self.is_calibrated = True
+                    logger.info(f"✅ Soccer CALIBRATED (simple) model loaded from {calibrated_path}")
+                except Exception as e:
+                    logger.warning(f"Could not load calibrated model: {e}")
+
+        # 3. Fallback final: Modelo antiguo sin calibrar
+        if self.soccer_model is None:
+            fallback_path = "models/soccer_model.pkl"
+            try:
+                self.soccer_model = BettingModel.load(fallback_path)
+                self.model_type = "legacy"
+                logger.warning(f"⚠️ Using LEGACY (uncalibrated) soccer model from {fallback_path}")
+                logger.warning("   Train advanced model with: python train_ensemble_model.py")
+            except FileNotFoundError:
+                logger.error(f"❌ No soccer model found")
+                self.soccer_model = None
+
+        # NBA model (sin calibrar por ahora)
         try:
             self.nba_model = BettingModel.load(nba_model_path)
             logger.info("NBA model loaded successfully")
@@ -63,8 +107,20 @@ class MatchPredictor:
                 'probabilities': {}
             }
 
-        # Calcular features usando el mismo método que en training
-        features_dict = self.db.calculate_match_features(match)
+        # Calcular features - usar avanzadas si modelo calibrado
+        if sport == "soccer" and self.is_calibrated:
+            # Modelo calibrado: usar features avanzadas (ELO, form, H2H, etc.)
+            try:
+                features_dict = calculate_match_features_advanced(match, self.db)
+            except Exception as e:
+                logger.error(f"Error calculating advanced features: {e}")
+                return {
+                    'error': f'Could not calculate advanced features: {str(e)}',
+                    'probabilities': {}
+                }
+        else:
+            # Modelo antiguo o NBA: usar features básicas
+            features_dict = self.db.calculate_match_features(match)
 
         if features_dict is None:
             logger.warning(f"Could not calculate features for {home_team} vs {away_team}")
@@ -93,10 +149,12 @@ class MatchPredictor:
             'prediction': prediction,
             'confidence': confidence,
             'probabilities': probabilities,
-            'odds': match['odds']
+            'odds': match['odds'],
+            'model_type': self.model_type,  # Nuevo: identificar modelo usado
+            'is_calibrated': self.is_calibrated
         }
 
-        logger.info(f"Prediction: {prediction} (confidence: {confidence:.2%})")
+        logger.info(f"Prediction: {prediction} (confidence: {confidence:.2%}) [Model: {self.model_type}]")
 
         return result
 
